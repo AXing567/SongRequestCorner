@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.playwright/
+.data/
+.agents/
+.claude/
+.codex/
+.cursor/
+.trellis/
+AGENTS.md
+*.log

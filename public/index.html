@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>点歌队列</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Company Music</p>
+          <h1>点歌队列</h1>
+        </div>
+        <div class="status-pill" id="playerState">连接中</div>
+      </header>
+
+      <section class="now">
+        <div class="now-info">
+          <p class="label">当前播放</p>
+          <h2 id="currentTitle">暂无播放</h2>
+          <p id="currentMeta">等待下一首点歌</p>
+        </div>
+        <div class="controls" aria-label="播放控制">
+          <button data-action="pause" title="暂停">⏸</button>
+          <button data-action="resume" title="继续">▶</button>
+          <button data-action="skip" title="切歌">⏭</button>
+        </div>
+      </section>
+
+      <section class="queue-head">
+        <div>
+          <p class="label">待播列表</p>
+          <h2><span id="queueCount">0</span> 首等待中</h2>
+        </div>
+        <button id="refreshBtn" title="刷新">刷新</button>
+      </section>
+
+      <section class="queue" id="queueList"></section>
+
+      <section class="queue-head history-head">
+        <div>
+          <p class="label">历史记录</p>
+          <h2>近 7 日播放过 <span id="historyCount">0</span> 首</h2>
+        </div>
+        <div class="history-tools">
+          <select id="historyDay" title="按日期筛选">
+            <option value="">全部日期</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="queue history" id="historyList"></section>
+
+      <section class="pager" aria-label="历史分页">
+        <button id="historyPrev" title="上一页">上一页</button>
+        <span id="historyPageText">第 1 页</span>
+        <button id="historyNext" title="下一页">下一页</button>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
