@@ -75,7 +75,8 @@ In the Feishu developer console:
 3. Add the bot to your target group.
 4. Subscribe to `im.message.receive_v1`.
 5. Use long connection event subscription.
-6. Copy the app id and app secret into `.env`.
+6. Grant message send plus image upload/send permissions so the bot can post NetEase login QR codes when needed.
+7. Copy the app id and app secret into `.env`.
 
 Then set:
 
@@ -118,6 +119,8 @@ CHROME_EXECUTABLE_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
 
 Start the service and request a song. A normal browser window opens. Log in to NetEase Cloud Music in that window. The login state is stored under `NETEASE_USER_DATA_DIR`.
 
+If the NetEase web login state expires, the bot checks the playback page, posts a login notice and QR image to the last active Feishu group, and then thanks the NetEase account name it sees after login recovers. If the QR image does not arrive in Feishu, verify the app's image upload/send permissions in the Feishu developer console.
+
 If `CHROME_EXECUTABLE_PATH` is empty, install Playwright Chromium:
 
 ```bash
@@ -154,6 +157,8 @@ npm ci
 npm run build
 npm start
 ```
+
+`npm run build` builds both the Node.js service and the React admin console into `public/`.
 
 For a Windows always-on setup, see [docs/windows-service.md](docs/windows-service.md).
 

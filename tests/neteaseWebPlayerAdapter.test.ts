@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
+import type { QueueItem } from "../src/domain/types.js";
 import {
   NETEASE_SONG_PAGE_PLAY_SELECTORS,
+  NeteaseWebPlayerAdapter,
+  mergeNeteaseLoginSurfaceSnapshots,
+  neteaseBottomPlayerControlLooksPlaying,
   neteaseSongIdFromUrl,
   neteaseUrlContainsSongId,
-  neteaseTextContainsTrackTitle
+  neteaseTextContainsTrackTitle,
+  resolveNeteaseLoginSurface
 } from "../src/players/NeteaseWebPlayerAdapter.js";
 
 describe("NETEASE_SONG_PAGE_PLAY_SELECTORS", () => {
@@ -33,6 +38,179 @@ describe("neteaseTextContainsTrackTitle", () => {
   });
 });
 
+describe("neteaseBottomPlayerControlLooksPlaying", () => {
+  it("detects common NetEase playing-state class names and labels", () => {
+    expect(neteaseBottomPlayerControlLooksPlaying("ply pas")).toBe(true);
+    expect(neteaseBottomPlayerControlLooksPlaying("btnc-ply pause")).toBe(true);
+    expect(neteaseBottomPlayerControlLooksPlaying("title 暂停")).toBe(true);
+  });
+
+  it("does not treat idle play controls as already playing", () => {
+    expect(neteaseBottomPlayerControlLooksPlaying("ply play 播放")).toBe(false);
+  });
+});
+
+describe("resolveNeteaseLoginSurface", () => {
+  it("detects logged-in profile candidates and returns the account name", () => {
+    expect(
+      resolveNeteaseLoginSurface({
+        profileCandidateCount: 1,
+        profileTexts: ["Alice 个人主页 设置 退出"],
+        loginTexts: []
+      })
+    ).toEqual({ state: "logged_in", accountName: "Alice" });
+  });
+
+  it("prefers a visible profile candidate over stale login text", () => {
+    expect(
+      resolveNeteaseLoginSurface({
+        profileCandidateCount: 1,
+        profileTexts: ["Alice"],
+        loginTexts: ["登录"]
+      })
+    ).toEqual({ state: "logged_in", accountName: "Alice" });
+  });
+
+  it("detects a visible login entry without treating normal navigation as login", () => {
+    expect(
+      resolveNeteaseLoginSurface({
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginTexts: ["发现音乐", "我的音乐", "登录"]
+      })
+    ).toEqual({ state: "login_required" });
+  });
+  it("merges login surface snapshots from page frames", () => {
+    const snapshot = mergeNeteaseLoginSurfaceSnapshots([
+      { profileCandidateCount: 0, profileTexts: [], loginTexts: [] },
+      { profileCandidateCount: 0, profileTexts: [], loginTexts: ["login"] }
+    ]);
+
+    expect(resolveNeteaseLoginSurface(snapshot)).toEqual({ state: "login_required" });
+  });
+});
+
+describe("NeteaseWebPlayerAdapter pause control", () => {
+  it("uses a DOM fallback when the normal locator click cannot reach the bottom-player toggle", async () => {
+    const page = new FakePage({ domToggleSucceeds: true });
+    const adapter = adapterWithPage(page);
+
+    await adapter.pause();
+
+    expect(adapterInternals(adapter).paused).toBe(true);
+    expect(page.domToggleAttempts).toBe(1);
+  });
+
+  it("does not mark playback as paused when no pause control can be triggered", async () => {
+    const adapter = adapterWithPage(new FakePage({ domToggleSucceeds: false }));
+
+    await expect(adapter.pause()).rejects.toThrow("Could not pause the NetEase web player");
+
+    expect(adapterInternals(adapter).paused).toBe(false);
+  });
+});
+
+describe("NeteaseWebPlayerAdapter login QR detection", () => {
+  it("does not open a login QR when the page login state is unknown", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      loginEntryClicksBeforeSuccess: 1,
+      dialogScreenshot: Buffer.from("dialog")
+    });
+    const adapter = adapterWithPage(page);
+    adapterInternals(adapter).current = undefined;
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status.state).toBe("unknown");
+    expect(page.loginEntryClicks).toBe(0);
+  });
+
+  it("returns login_required when the page state is unknown but a QR is already visible", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      qrScreenshot: Buffer.from("qr")
+    });
+    const adapter = adapterWithPage(page);
+    adapterInternals(adapter).current = undefined;
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status.state).toBe("login_required");
+    expect(status.qrCode?.data.toString()).toBe("qr");
+  });
+
+  it("falls back to sending the login dialog screenshot when no QR candidate is found", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      surfaceSnapshot: {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginTexts: ["登录"]
+      },
+      loginEntryClicksBeforeSuccess: 1,
+      dialogScreenshot: Buffer.from("dialog")
+    });
+    const adapter = adapterWithPage(page);
+    adapterInternals(adapter).current = undefined;
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status.state).toBe("login_required");
+    expect(status.qrCode?.data.toString()).toBe("dialog");
+    expect(page.loginEntryClicks).toBeGreaterThanOrEqual(1);
+  });
+
+  it("opens the login QR in a temporary page when a browser context is available", async () => {
+    const mainPage = new FakePage({
+      domToggleSucceeds: false,
+      surfaceSnapshot: {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginTexts: ["登录"]
+      },
+      loginEntryClicksBeforeSuccess: 1,
+      dialogScreenshot: Buffer.from("main-dialog")
+    });
+    const loginPage = new FakePage({
+      domToggleSucceeds: false,
+      surfaceSnapshot: {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginTexts: ["登录"]
+      },
+      loginEntryClicksBeforeSuccess: 1,
+      dialogScreenshot: Buffer.from("isolated-dialog")
+    });
+    const adapter = adapterWithPage(mainPage);
+    adapterInternals(adapter).current = undefined;
+    adapterInternals(adapter).context = new FakeBrowserContext(loginPage);
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status.state).toBe("login_required");
+    expect(status.qrCode?.data.toString()).toBe("isolated-dialog");
+    expect(mainPage.loginEntryClicks).toBe(0);
+    expect(loginPage.gotoCalls).toBe(1);
+    expect(loginPage.loginEntryClicks).toBeGreaterThanOrEqual(1);
+    expect(loginPage.closed).toBe(true);
+  });
+});
+
+describe("NeteaseWebPlayerAdapter lifecycle", () => {
+  it("closes the persistent browser context so the profile can flush to disk", async () => {
+    const adapter = adapterWithPage(new FakePage({ domToggleSucceeds: false }));
+    const context = new FakeBrowserContext();
+    adapterInternals(adapter).context = context;
+
+    await adapter.dispose();
+
+    expect(context.closed).toBe(true);
+    expect(adapterInternals(adapter).page).toBeUndefined();
+    expect(adapterInternals(adapter).current).toBeUndefined();
+  });
+});
+
 describe("NetEase song URL helpers", () => {
   it("extracts song ids from NetEase hash URLs", () => {
     expect(neteaseSongIdFromUrl("https://music.163.com/#/song?id=145962")).toBe("145962");
@@ -43,3 +221,193 @@ describe("NetEase song URL helpers", () => {
     expect(neteaseUrlContainsSongId("https://music.163.com/#/song?id=1", "145962")).toBe(false);
   });
 });
+
+class FakePage {
+  domToggleAttempts = 0;
+  loginEntryClicks = 0;
+  gotoCalls = 0;
+  closed = false;
+  keyboard = {
+    press: async () => undefined
+  };
+
+  constructor(
+    private readonly options: {
+      domToggleSucceeds: boolean;
+      mediaPauseSucceeds?: boolean;
+      qrScreenshot?: Buffer;
+      dialogScreenshot?: Buffer;
+      loginEntryClicksBeforeSuccess?: number;
+      surfaceSnapshot?: {
+        profileCandidateCount: number;
+        profileTexts: string[];
+        loginTexts: string[];
+      };
+    }
+  ) {}
+
+  frames(): FakePage[] {
+    return [];
+  }
+
+  locator(selector: string): FakeLocator {
+    if (selector === "#g_player") {
+      return new FakeLocator(() => {
+        this.domToggleAttempts += 1;
+        return this.options.domToggleSucceeds;
+      });
+    }
+
+    if (selector.includes("has-text")) {
+      return new FakeLocator(() => "", {
+        click: () => {
+          this.loginEntryClicks += 1;
+          return this.loginEntryClicks <= (this.options.loginEntryClicksBeforeSuccess ?? 0);
+        }
+      });
+    }
+
+    if (selector === ".m-layer") {
+      return new FakeLocator(() => "", {
+        screenshot: this.options.dialogScreenshot,
+        width: 180,
+        height: 180
+      });
+    }
+
+    if (selector.includes("qr") || selector.includes("QRCode") || selector.includes("unikey")) {
+      return new FakeLocator(() => "", {
+        screenshot: this.options.qrScreenshot,
+        width: 88,
+        height: 88
+      });
+    }
+
+    return new FakeLocator(() => "");
+  }
+
+  async evaluate(callback?: () => unknown): Promise<boolean | unknown> {
+    if (callback?.toString().includes("profileCandidateCount")) {
+      return this.options.surfaceSnapshot ?? {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginTexts: []
+      };
+    }
+
+    return this.options.mediaPauseSucceeds ?? false;
+  }
+
+  async waitForTimeout(): Promise<void> {}
+
+  async goto(): Promise<void> {
+    this.gotoCalls += 1;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+}
+
+class FakeLocator {
+  constructor(
+    private readonly evaluateResult: () => unknown,
+    private readonly options: {
+      click?: () => boolean;
+      screenshot?: Buffer;
+      width?: number;
+      height?: number;
+    } = {}
+  ) {}
+
+  first(): FakeLocator {
+    return this;
+  }
+
+  async waitFor(): Promise<void> {
+    if (!this.options.screenshot && !this.options.click) {
+      throw new Error("not visible");
+    }
+  }
+
+  async scrollIntoViewIfNeeded(): Promise<void> {}
+
+  async click(): Promise<void> {
+    if (this.options.click && !this.options.click()) {
+      throw new Error("click failed");
+    }
+  }
+
+  async getAttribute(): Promise<string> {
+    return "";
+  }
+
+  async evaluate(): Promise<unknown> {
+    return this.evaluateResult();
+  }
+
+  async textContent(): Promise<string> {
+    return "";
+  }
+
+  async boundingBox(): Promise<{ width: number; height: number } | undefined> {
+    if (!this.options.screenshot) {
+      return undefined;
+    }
+
+    return {
+      width: this.options.width ?? 100,
+      height: this.options.height ?? 100
+    };
+  }
+
+  async screenshot(): Promise<Buffer> {
+    if (!this.options.screenshot) {
+      throw new Error("missing screenshot");
+    }
+
+    return this.options.screenshot;
+  }
+}
+
+class FakeBrowserContext {
+  closed = false;
+
+  constructor(private readonly nextPage?: FakePage) {}
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+
+  async newPage(): Promise<FakePage> {
+    return this.nextPage ?? new FakePage({ domToggleSucceeds: false });
+  }
+}
+
+function adapterWithPage(page: FakePage): NeteaseWebPlayerAdapter {
+  const adapter = new NeteaseWebPlayerAdapter({ userDataDir: "", headless: true });
+  const internals = adapterInternals(adapter);
+  internals.page = page;
+  internals.current = {
+    id: "queue-1",
+    track: { id: "track-1", title: "晴天", artist: "周杰伦", source: "netease" },
+    requester: { id: "u1", role: "employee" },
+    requestedAt: new Date()
+  };
+  internals.paused = false;
+  return adapter;
+}
+
+function adapterInternals(adapter: NeteaseWebPlayerAdapter): {
+  page?: FakePage;
+  context?: FakeBrowserContext;
+  current?: QueueItem;
+  paused: boolean;
+} {
+  return adapter as unknown as {
+    page?: FakePage;
+    context?: FakeBrowserContext;
+    current?: QueueItem;
+    paused: boolean;
+  };
+}

@@ -24,7 +24,8 @@ Feishu group -> FeishuTransport -> CommandService -> QueueService
 4. `CommandService` searches music and updates the queue.
 5. `PlaybackEngine` serializes playback operations and starts songs.
 6. `NeteaseWebPlayerAdapter` opens NetEase song pages and verifies the bottom player switched to the target track.
-7. The admin page polls `/api/status` and loads history from `/api/history`.
+7. `LoginNotifier` watches login-aware players; when NetEase login expires, it asks the transport to send a QR image and later thanks the recovered account name.
+8. The admin page polls `/api/status` and loads history from `/api/history`.
 
 ## Queue And History
 
@@ -54,6 +55,7 @@ Implement `BotTransport`:
 interface BotTransport {
   start(onMessage: (message: IncomingMessage) => Promise<void>): Promise<void>;
   sendText(chatId: string, text: string): Promise<void>;
+  sendImage?(chatId: string, image: PlayerLoginQrCode): Promise<void>;
   replyText?(messageId: string, text: string): Promise<void>;
 }
 ```
@@ -89,6 +91,16 @@ interface PlayerAdapter {
 
 The adapter should only report `current` when the real player is actually on the bot-requested song.
 
+Players that can detect session state may also implement `LoginAwarePlayerAdapter`:
+
+```typescript
+interface LoginAwarePlayerAdapter extends PlayerAdapter {
+  getLoginStatus(): Promise<PlayerLoginStatus>;
+}
+```
+
+`LoginNotifier` uses that optional method to send NetEase QR-code login prompts through the active `BotTransport`.
+
 ## HTTP Admin API
 
 - `GET /api/status`
@@ -101,3 +113,27 @@ The adapter should only report `current` when the real player is actually on the
 - `POST /api/queue/:id/move`
 
 `POST /api/queue/clear` intentionally returns `410` to avoid accidental full queue deletion.
+
+## Admin Frontend
+
+The admin page is a Vite + React + TypeScript app under `src/admin`.
+
+```text
+src/admin/index.html
+src/admin/src/AdminApp.tsx
+src/admin/src/components/
+src/admin/src/hooks/
+src/admin/src/api/
+src/admin/src/types/
+src/admin/src/motion/
+```
+
+Build output goes to `public/`, which is still served by `src/server/AdminServer.ts`. This keeps the backend static-file contract unchanged.
+
+Key conventions:
+
+- API calls live in `src/admin/src/api/adminApi.ts`.
+- API response types live in `src/admin/src/types/api.ts`.
+- Motion constants live in `src/admin/src/motion/presets.ts`.
+- Components should use lucide-react icons and Framer Motion for focused micro-interactions.
+- Do not add a clear-queue action to the UI.

@@ -4,6 +4,7 @@ import { stdin as input, stdout as output } from "node:process";
 import type { AppConfig } from "../config.js";
 import type { IncomingMessage } from "../domain/types.js";
 import type { BotTransport } from "./BotTransport.js";
+import type { PlayerLoginQrCode } from "../players/PlayerAdapter.js";
 
 export class ConsoleTransport implements BotTransport {
   constructor(private readonly config: AppConfig) {}
@@ -35,6 +36,10 @@ export class ConsoleTransport implements BotTransport {
 
   async sendText(_chatId: string, text: string): Promise<void> {
     console.log(`[bot] ${text}`);
+  }
+
+  async sendImage(_chatId: string, image: PlayerLoginQrCode): Promise<void> {
+    console.log(`[bot image] ${image.filename ?? "image.png"} (${image.mimeType}, ${image.data.length} bytes)`);
   }
 
   async replyText(messageId: string, text: string): Promise<void> {

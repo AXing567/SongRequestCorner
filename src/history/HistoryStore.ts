@@ -47,11 +47,12 @@ export class InMemoryHistoryStore implements HistoryStore {
     const filtered = this.history
       .filter((item) => !options.day || dayKey(item.playedAt) === options.day)
       .sort((left, right) => right.playedAt.getTime() - left.playedAt.getTime());
+    const visible = dedupeHistoryForList(filtered);
     const offset = (page - 1) * pageSize;
 
     return {
-      items: filtered.slice(offset, offset + pageSize),
-      total: filtered.length,
+      items: visible.slice(offset, offset + pageSize),
+      total: visible.length,
       page,
       pageSize,
       days: uniqueDays(this.history)
@@ -129,22 +130,17 @@ export class SqliteHistoryStore implements HistoryStore {
           .prepare(
             `SELECT * FROM play_history
              WHERE played_at >= ? AND played_at < ?
-             ORDER BY played_at DESC
-             LIMIT ? OFFSET ?`
+             ORDER BY played_at DESC`
           )
-          .all(range.start, range.end, pageSize, offset)
+          .all(range.start, range.end)
       : this.db
-          .prepare(`SELECT * FROM play_history ORDER BY played_at DESC LIMIT ? OFFSET ?`)
-          .all(pageSize, offset);
-    const totalRow = range
-      ? this.db
-          .prepare(`SELECT COUNT(*) AS total FROM play_history WHERE played_at >= ? AND played_at < ?`)
-          .get(range.start, range.end)
-      : this.db.prepare(`SELECT COUNT(*) AS total FROM play_history`).get();
+          .prepare(`SELECT * FROM play_history ORDER BY played_at DESC`)
+          .all();
+    const visible = dedupeHistoryForList(rows.map(rowToHistoryItem));
 
     return {
-      items: rows.map(rowToHistoryItem),
-      total: Number(totalRow?.total ?? 0),
+      items: visible.slice(offset, offset + pageSize),
+      total: visible.length,
       page,
       pageSize,
       days: this.listDays()
@@ -197,6 +193,39 @@ function uniqueDays(history: HistoryItem[]): string[] {
   return history
     .map((item) => dayKey(item.playedAt))
     .filter((day, index, days) => days.indexOf(day) === index);
+}
+
+function dedupeHistoryForList(history: HistoryItem[]): HistoryItem[] {
+  const seen = new Set<string>();
+
+  return history.filter((item) => {
+    const key = historyListDedupeKey(item);
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function historyListDedupeKey(item: HistoryItem): string {
+  const stableTrackId = normalizeTrackText(item.track.id);
+  if (stableTrackId) {
+    return [dayKey(item.playedAt), item.track.source, "id", stableTrackId].join("\u0000");
+  }
+
+  return [
+    dayKey(item.playedAt),
+    item.track.source,
+    "text",
+    normalizeTrackText(item.track.title),
+    normalizeTrackText(item.track.artist)
+  ].join("\u0000");
+}
+
+function normalizeTrackText(value: string): string {
+  return value.trim().replace(/\s+/gu, " ").toLowerCase();
 }
 
 function normalizePage(value?: number): number {

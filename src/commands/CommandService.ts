@@ -6,6 +6,7 @@ import { formatQueueItem, formatTrack, pluralSong } from "../utils/format.js";
 
 export interface CommandResult {
   text: string;
+  shouldCheckLogin?: boolean;
 }
 
 export class CommandService {
@@ -62,7 +63,10 @@ export class CommandService {
     try {
       await this.playback.ensurePlaying();
     } catch (error) {
-      return { text: `点歌失败：播放端无法播放这首歌，${errorMessage(error)}` };
+      return {
+        text: `点歌失败：播放端无法播放这首歌，${errorMessage(error)}`,
+        shouldCheckLogin: true
+      };
     }
 
     return { text: `已加入队列：${formatTrack(track)}，目前第 ${position} 首` };
