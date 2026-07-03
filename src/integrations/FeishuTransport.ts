@@ -47,11 +47,16 @@ interface FeishuMessageEventBody {
   };
 }
 
+const FEISHU_CONNECT_WAIT_MS = 30_000;
+const FEISHU_STATUS_LOG_INTERVAL_MS = 10_000;
+
 export class FeishuTransport implements BotTransport {
   private tenantToken?: { value: string; expiresAt: number };
   private sdk: any;
   private wsClient?: any;
   private dispatcher?: any;
+  private statusMonitor?: NodeJS.Timeout;
+  private lastLoggedConnectionState?: string;
 
   constructor(private readonly config: AppConfig) {
     if (!config.feishu.appId || !config.feishu.appSecret) {
@@ -88,14 +93,76 @@ export class FeishuTransport implements BotTransport {
         await this.handleMessageEvent(event, onMessage);
       }
     });
+    this.wrapDispatcherForDiagnostics();
 
     await this.wsClient.start({ eventDispatcher: this.dispatcher });
-    console.log("[feishu] websocket bot started");
-    setTimeout(() => {
-      if (typeof this.wsClient?.getConnectionStatus === "function") {
-        console.log("[feishu] connection status", this.wsClient.getConnectionStatus());
+    this.startConnectionStatusMonitor();
+    await this.waitForConnected();
+  }
+
+  private startConnectionStatusMonitor(): void {
+    this.statusMonitor ??= setInterval(() => {
+      this.logConnectionStatus();
+    }, FEISHU_STATUS_LOG_INTERVAL_MS);
+    this.statusMonitor.unref?.();
+    this.logConnectionStatus();
+  }
+
+  private async waitForConnected(): Promise<void> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < FEISHU_CONNECT_WAIT_MS) {
+      const status = this.getConnectionStatus();
+      if (status?.state === "connected") {
+        console.log("[feishu] websocket bot started and connected");
+        return;
       }
-    }, 2000);
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    const status = this.getConnectionStatus();
+    console.warn(
+      `[feishu] websocket is not connected yet: ${JSON.stringify(
+        status
+      )}. The bot will not receive group mentions until this becomes connected.`
+    );
+  }
+
+  private logConnectionStatus(): void {
+    const status = this.getConnectionStatus();
+    if (!status) {
+      return;
+    }
+
+    const state = String(status.state ?? "unknown");
+    if (state === this.lastLoggedConnectionState && state === "connected") {
+      return;
+    }
+
+    this.lastLoggedConnectionState = state;
+    const level = state === "connected" ? "log" : "warn";
+    console[level]("[feishu] connection status", status);
+  }
+
+  private getConnectionStatus(): { state?: string; [key: string]: unknown } | undefined {
+    if (typeof this.wsClient?.getConnectionStatus !== "function") {
+      return undefined;
+    }
+
+    return this.wsClient.getConnectionStatus();
+  }
+
+  private wrapDispatcherForDiagnostics(): void {
+    if (!this.dispatcher || typeof this.dispatcher.invoke !== "function") {
+      return;
+    }
+
+    const originalInvoke = this.dispatcher.invoke.bind(this.dispatcher);
+    this.dispatcher.invoke = async (event: unknown, params?: unknown) => {
+      const eventType = readFeishuEventType(event);
+      console.log(`[feishu] raw event received: ${eventType ?? "unknown"}`);
+      return await originalInvoke(event, params);
+    };
   }
 
   private async handleMessageEvent(
@@ -369,6 +436,46 @@ function firstString(...values: unknown[]): string {
   }
 
   return "";
+}
+
+function readFeishuEventType(event: unknown): string | undefined {
+  const eventRecord = asRecord(event);
+  if (!eventRecord) {
+    return undefined;
+  }
+
+  const direct =
+    firstPlainString(eventRecord.type, eventRecord.event_type) ||
+    firstPlainString(asRecord(eventRecord.header)?.event_type) ||
+    firstPlainString(asRecord(eventRecord.event)?.type, asRecord(eventRecord.event)?.event_type);
+  if (direct) {
+    return direct;
+  }
+
+  const data = eventRecord.data;
+  if (typeof data !== "string") {
+    return undefined;
+  }
+
+  try {
+    return readFeishuEventType(JSON.parse(data));
+  } catch {
+    return undefined;
+  }
+}
+
+function firstPlainString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
 function errorMessage(error: unknown): string {

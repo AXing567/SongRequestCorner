@@ -85,6 +85,22 @@ describe("SqliteHistoryStore", () => {
     second.close();
   });
 
+  it("persists the pending queue across store instances in order", () => {
+    const dbPath = tempDbPath();
+    const first = new SqliteHistoryStore(dbPath);
+    first.savePendingQueue([item("第一首"), item("第二首")]);
+    first.close();
+
+    const second = new SqliteHistoryStore(dbPath);
+    expect(second.loadPendingQueue().map((queueItem) => queueItem.track.title)).toEqual(["第一首", "第二首"]);
+    second.savePendingQueue([item("第三首")]);
+    second.close();
+
+    const third = new SqliteHistoryStore(dbPath);
+    expect(third.loadPendingQueue().map((queueItem) => queueItem.track.title)).toEqual(["第三首"]);
+    third.close();
+  });
+
   it("supports date filtering, pagination, and seven-day retention", () => {
     const store = new SqliteHistoryStore(tempDbPath());
     store.record(item("旧歌"), new Date("2026-06-21T10:00:00+08:00"));

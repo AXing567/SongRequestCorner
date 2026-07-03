@@ -3,6 +3,7 @@ import type { PlayerStatus, QueueItem } from "../domain/types.js";
 
 export interface PlayerAdapter {
   getStatus(): Promise<PlayerStatus>;
+  warmUp?(): Promise<void> | void;
   play(item: QueueItem): Promise<void>;
   skip(): Promise<void>;
   pause(): Promise<void>;

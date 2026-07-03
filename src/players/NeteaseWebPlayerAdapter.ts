@@ -78,6 +78,12 @@ const LOGIN_DIALOG_CLOSE_SELECTORS = [
   "[role='dialog'] span:has-text('×')"
 ] as const;
 
+const SONG_PAGE_NAVIGATION_TIMEOUT_MS = 4_000;
+const SONG_PAGE_READY_TIMEOUT_MS = 4_000;
+const PLAYBACK_SIGNAL_TIMEOUT_MS = 5_000;
+const PLAYBACK_POLL_INTERVAL_MS = 125;
+const FAST_CONTROL_TIMEOUT_MS = 350;
+
 export class NeteaseLoginRequiredError extends Error {
   constructor(message = "网易云登录状态已失效，需要扫码登录后再播放。") {
     super(message);
@@ -93,6 +99,13 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
   private paused = false;
 
   constructor(private readonly options: NeteaseWebPlayerOptions) {}
+
+  async warmUp(): Promise<void> {
+    const startedAt = Date.now();
+    const page = await this.ensurePage();
+    const surface = await this.readLoginSurfaceAfterSettling(page);
+    console.log(`[netease-web] warm-up finished with login state ${surface.state} in ${Date.now() - startedAt}ms`);
+  }
 
   async getLoginStatus(): Promise<PlayerLoginStatus> {
     const page = await this.ensurePage();
@@ -147,15 +160,18 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       throw new Error("Track is missing a NetEase song URL.");
     }
 
+    const startedAt = Date.now();
     const page = await this.ensurePage();
     await this.assertLoggedInForPlayback(page);
     this.current = undefined;
     this.paused = false;
 
-    await this.pauseCurrentPagePlayback();
-    await page.goto(item.track.sourceUrl, { waitUntil: "domcontentloaded" });
-    await this.ensureSongFrameRoute(page, item);
+    await this.pauseCurrentPagePlayback({ allowKeyboardFallback: false });
+    await this.navigateToSongPage(page, item);
     await this.waitForSongPageReady(page, item);
+    console.log(
+      `[netease-web] target page ready for ${item.track.artist} - ${item.track.title} in ${Date.now() - startedAt}ms`
+    );
 
     const clicked = await this.clickSongPagePlay(page);
     if (!clicked) {
@@ -166,7 +182,9 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     await this.waitForPlaybackSignal(page, item, async () => {
       await this.clickSongPagePlay(page);
     });
-    console.log(`[netease-web] playback detected for ${item.track.artist} - ${item.track.title}`);
+    console.log(
+      `[netease-web] playback detected for ${item.track.artist} - ${item.track.title} in ${Date.now() - startedAt}ms`
+    );
     this.current = item;
   }
 
@@ -212,8 +230,8 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
   }
 
   async clear(): Promise<void> {
-    if (this.page) {
-      await this.pauseCurrentPagePlayback();
+    if (this.page && !this.paused) {
+      await this.pauseCurrentPagePlayback({ allowKeyboardFallback: false });
     }
 
     this.current = undefined;
@@ -292,11 +310,14 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     const snapshots = await Promise.all(
       this.locatorSurfaces(page).map((surface) => readNeteaseLoginSurfaceSnapshot(surface))
     );
-    const domSurface = resolveNeteaseLoginSurface(mergeNeteaseLoginSurfaceSnapshots(snapshots));
+    const mergedSnapshot = mergeNeteaseLoginSurfaceSnapshots(snapshots);
+    const domSurface = resolveNeteaseLoginSurface(mergedSnapshot);
     const cookieSurface = await this.readCookieLoginSurface();
 
     if (cookieSurface?.state === "logged_in" || domSurface.state === "logged_in") {
-      await this.dismissStaleLoginDialog(page);
+      if (neteaseSnapshotHasLoginDialog(mergedSnapshot)) {
+        await this.dismissStaleLoginDialog(page);
+      }
       if (domSurface.state === "logged_in") {
         return domSurface;
       }
@@ -426,7 +447,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
 
   private async dismissStaleLoginDialog(page: PageLike): Promise<void> {
     for (const surface of this.locatorSurfaces(page)) {
-      if (await this.clickFirst(surface, LOGIN_DIALOG_CLOSE_SELECTORS, false)) {
+      if (await this.clickFirst(surface, LOGIN_DIALOG_CLOSE_SELECTORS, false, FAST_CONTROL_TIMEOUT_MS)) {
         await page.waitForTimeout(150).catch(() => undefined);
         return;
       }
@@ -493,7 +514,87 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
   }
 
   private async clickSongPagePlay(page: PageLike): Promise<boolean> {
-    return this.clickAny(page, NETEASE_SONG_PAGE_PLAY_SELECTORS);
+    return (await this.clickSongPagePlayViaDom(page)) || (await this.clickAny(page, NETEASE_SONG_PAGE_PLAY_SELECTORS));
+  }
+
+  private async clickSongPagePlayViaDom(page: PageLike): Promise<boolean> {
+    for (const surface of this.locatorSurfaces(page)) {
+      const clicked = await surface
+        .evaluate(() => {
+          const candidates = Array.from(
+            document.querySelectorAll<HTMLElement>(
+              ".m-info .btns a.u-btni-addply, .m-info .btns a[data-res-action='play'], .m-info .btns a[title='\\64ad\\653e']"
+            )
+          );
+          const target =
+            candidates.find((candidate) => {
+              const style = window.getComputedStyle(candidate);
+              const rect = candidate.getBoundingClientRect();
+              return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+            }) ?? candidates[0];
+
+          if (!target) {
+            return false;
+          }
+
+          target.click();
+          return true;
+        })
+        .catch(() => false);
+
+      if (clicked) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async navigateToSongPage(page: PageLike, item: QueueItem): Promise<void> {
+    const songId = neteaseSongIdFromUrl(item.track.sourceUrl);
+    if (!songId) {
+      await page.goto(item.track.sourceUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: SONG_PAGE_NAVIGATION_TIMEOUT_MS
+      });
+      return;
+    }
+
+    const routedInPlace = await page
+      .evaluate((targetSongId: string) => {
+        const hash = `#/song?id=${targetSongId}`;
+        const expectedPath = `/song?id=${targetSongId}`;
+        const iframe = document.querySelector<HTMLIFrameElement>("iframe#g_iframe");
+        if (window.location.hostname.includes("music.163.com") && window.location.hash !== hash) {
+          window.location.hash = hash;
+        }
+
+        if (!iframe) {
+          return false;
+        }
+
+        if (!iframe.src.includes(expectedPath)) {
+          iframe.src = `https://music.163.com${expectedPath}`;
+        }
+
+        return true;
+      }, songId)
+      .catch(() => false);
+
+    if (!routedInPlace) {
+      await page
+        .goto(item.track.sourceUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: SONG_PAGE_NAVIGATION_TIMEOUT_MS
+        })
+        .catch(async (error: unknown) => {
+          if (!(await this.songRouteMatches(page, item))) {
+            throw error;
+          }
+        });
+    }
+
+    await this.ensureSongFrameRoute(page, item);
   }
 
   private async ensureSongFrameRoute(page: PageLike, item: QueueItem): Promise<void> {
@@ -503,8 +604,12 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     }
 
     await page
-      .locator("iframe#g_iframe")
-      .evaluate((iframe: HTMLIFrameElement, targetSongId: string) => {
+      .evaluate((targetSongId: string) => {
+        const iframe = document.querySelector<HTMLIFrameElement>("iframe#g_iframe");
+        if (!iframe) {
+          return;
+        }
+
         const expectedPath = `/song?id=${targetSongId}`;
         if (!iframe.src.includes(expectedPath)) {
           iframe.src = `https://music.163.com${expectedPath}`;
@@ -514,21 +619,55 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
   }
 
   private async waitForSongPageReady(page: PageLike, item: QueueItem): Promise<void> {
-    const expectedSongId = neteaseSongIdFromUrl(item.track.sourceUrl);
-    for (let attempt = 0; attempt < 32; attempt += 1) {
-      const urlMatches = expectedSongId ? neteaseUrlContainsSongId(page.url?.() ?? "", expectedSongId) : true;
-
-      for (const selector of SONG_PAGE_READY_SELECTORS) {
-        const text = await this.readLocatorText(page, selector);
-        if (neteaseTextContainsTrackTitle(text, item.track) || (urlMatches && (await this.locatorCanBecomeVisible(page, selector)))) {
-          return;
-        }
+    const deadline = Date.now() + SONG_PAGE_READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const routeState = this.readSongRouteState(page, item);
+      const texts = await Promise.all(
+        SONG_PAGE_READY_SELECTORS.map((selector) => this.readLocatorText(page, selector, 80))
+      );
+      if (texts.some((text) => neteaseTextContainsTrackTitle(text, item.track))) {
+        return;
       }
 
-      await page.waitForTimeout(150);
+      const visibility = await Promise.all(
+        SONG_PAGE_READY_SELECTORS.map(async (selector) => {
+          if (!songRouteMatchesSelector(selector, routeState)) {
+            return false;
+          }
+
+          return await this.locatorCanBecomeVisible(page, selector, 120);
+        })
+      );
+      if (visibility.some(Boolean)) {
+        return;
+      }
+
+      await page.waitForTimeout(PLAYBACK_POLL_INTERVAL_MS);
     }
 
     throw new Error(`NetEase song page did not become playable: ${item.track.artist} - ${item.track.title}`);
+  }
+
+  private readSongRouteState(page: PageLike, item: QueueItem): { pageMatches: boolean; frameMatches: boolean } {
+    const expectedSongId = neteaseSongIdFromUrl(item.track.sourceUrl);
+    if (!expectedSongId) {
+      return { pageMatches: true, frameMatches: true };
+    }
+
+    const pageMatches = neteaseUrlContainsSongId(page.url?.() ?? "", expectedSongId);
+    const frames = typeof page.frames === "function" ? page.frames() : [];
+    const childFrames = frames.filter((frame: PageLike) =>
+      typeof frame.parentFrame === "function" ? frame.parentFrame() : frame !== page.mainFrame?.()
+    );
+    const frameMatches = childFrames.some((frame: PageLike) =>
+      neteaseUrlContainsSongId(frame.url?.() ?? "", expectedSongId)
+    );
+    return { pageMatches, frameMatches };
+  }
+
+  private async songRouteMatches(page: PageLike, item: QueueItem): Promise<boolean> {
+    const routeState = this.readSongRouteState(page, item);
+    return routeState.pageMatches || routeState.frameMatches;
   }
 
   private async waitForPlaybackSignal(
@@ -536,17 +675,23 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     item: QueueItem,
     retryPlay: () => Promise<void>
   ): Promise<void> {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    const startedAt = Date.now();
+    const retryAtMs = [700, 1_800, 3_200];
+    let nextRetryIndex = 0;
+
+    while (Date.now() - startedAt < PLAYBACK_SIGNAL_TIMEOUT_MS) {
       const bottomPlayerText = await this.readBottomPlayerText();
       if (neteaseTextContainsTrackTitle(bottomPlayerText, item.track)) {
         return;
       }
 
-      if (attempt === 6 || attempt === 14 || attempt === 24) {
+      if (nextRetryIndex < retryAtMs.length && Date.now() - startedAt >= retryAtMs[nextRetryIndex]!) {
+        await this.ensureSongFrameRoute(page, item);
         await retryPlay();
+        nextRetryIndex += 1;
       }
 
-      await page.waitForTimeout(150);
+      await page.waitForTimeout(PLAYBACK_POLL_INTERVAL_MS);
     }
 
     const loginSurface = await this.readLoginSurface(page);
@@ -559,27 +704,32 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     );
   }
 
-  private async readLocatorText(page: PageLike, selector: string): Promise<string> {
+  private async readLocatorText(page: PageLike, selector: string, timeoutMs = 150): Promise<string> {
     return await this.locatorFor(page, selector)
-      .textContent({ timeout: 150 })
+      .textContent({ timeout: timeoutMs })
       .catch(() => "");
   }
 
-  private async locatorCanBecomeVisible(page: PageLike, selector: string): Promise<boolean> {
+  private async locatorCanBecomeVisible(page: PageLike, selector: string, timeoutMs = 250): Promise<boolean> {
     const locator = this.locatorFor(page, selector);
     try {
-      await locator.waitFor({ state: "visible", timeout: 250 });
+      await locator.waitFor({ state: "visible", timeout: timeoutMs });
       return true;
     } catch {
       return false;
     }
   }
 
-  private async clickFirst(page: PageLike, selectors: readonly string[], required = true): Promise<boolean> {
+  private async clickFirst(
+    page: PageLike,
+    selectors: readonly string[],
+    required = true,
+    timeoutMs = 1500
+  ): Promise<boolean> {
     for (const selector of selectors) {
       try {
         const locator = this.locatorFor(page, selector);
-        if (await this.tryClick(locator)) {
+        if (await this.tryClick(locator, timeoutMs)) {
           return true;
         }
       } catch {
@@ -594,12 +744,14 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     return false;
   }
 
-  private async clickAny(page: PageLike, selectors: readonly string[]): Promise<boolean> {
-    const attempts = selectors.map((selector) => this.tryClick(this.locatorFor(page, selector), 900));
+  private async clickAny(page: PageLike, selectors: readonly string[], timeoutMs = 900): Promise<boolean> {
+    const attempts = selectors.map((selector) => this.tryClick(this.locatorFor(page, selector), timeoutMs));
     return (await Promise.all(attempts)).some(Boolean);
   }
 
-  private async pauseCurrentPagePlayback(options: { forceToggle?: boolean } = {}): Promise<boolean> {
+  private async pauseCurrentPagePlayback(
+    options: { forceToggle?: boolean; allowKeyboardFallback?: boolean } = {}
+  ): Promise<boolean> {
     if (!this.page) {
       return false;
     }
@@ -608,12 +760,18 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       return true;
     }
 
+    if (await this.clickBottomPlaybackToggleViaDom({ requirePlaying: options.forceToggle !== true })) {
+      return true;
+    }
+
     const shouldToggle = options.forceToggle === true || (await this.bottomPlayerLooksPlaying());
     if (shouldToggle && (await this.clickBottomPlaybackToggle())) {
       return true;
     }
 
-    await this.page.keyboard.press("MediaPlayPause").catch(() => undefined);
+    if (options.allowKeyboardFallback) {
+      await this.page.keyboard.press("MediaPlayPause").catch(() => undefined);
+    }
     return false;
   }
 
@@ -622,22 +780,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       return false;
     }
 
-    const controlState = await this.page
-      .locator("#g_player .ply, #g_player .btnc-ply, .btnc-ply")
-      .first()
-      .evaluate((element: Element) =>
-        [
-          element.getAttribute("class"),
-          element.getAttribute("title"),
-          element.getAttribute("aria-label"),
-          element.textContent
-        ]
-          .filter(Boolean)
-          .join(" ")
-      )
-      .catch(() => "");
-
-    return neteaseBottomPlayerControlLooksPlaying(controlState);
+    return neteaseBottomPlayerControlLooksPlaying(await this.readBottomPlayerControlState());
   }
 
   private async clickBottomPlaybackToggle(): Promise<boolean> {
@@ -645,13 +788,26 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       return false;
     }
 
-    if (await this.clickFirst(this.page, BOTTOM_PLAYER_TOGGLE_SELECTORS, false)) {
+    if (await this.clickBottomPlaybackToggleViaDom({ requirePlaying: false })) {
       return true;
     }
 
+    return await this.clickFirst(this.page, BOTTOM_PLAYER_TOGGLE_SELECTORS, false, FAST_CONTROL_TIMEOUT_MS);
+  }
+
+  private async clickBottomPlaybackToggleViaDom(options: { requirePlaying: boolean }): Promise<boolean> {
+    if (!this.page) {
+      return false;
+    }
+
     return await this.page
-      .locator("#g_player")
-      .evaluate((player: Element, selectors: readonly string[]) => {
+      .evaluate((args: { selectors: readonly string[]; requirePlaying: boolean }) => {
+        const player = document.querySelector("#g_player");
+        if (!player) {
+          return false;
+        }
+
+        const { selectors, requirePlaying } = args;
         const candidates = selectors.flatMap((selector) =>
           Array.from(player.querySelectorAll<HTMLElement>(selector.replace(/^#g_player\s*/u, "")))
         );
@@ -666,10 +822,51 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
           return false;
         }
 
+        const controlState = [
+          target.getAttribute("class"),
+          target.getAttribute("title"),
+          target.getAttribute("aria-label"),
+          target.textContent
+        ]
+          .filter(Boolean)
+          .join(" ");
+        const looksPlaying = /pas|pause|ply-z-slt|\u6682\u505c/iu.test(controlState);
+        if (requirePlaying && !looksPlaying) {
+          return false;
+        }
+
         target.click();
         return true;
-      }, BOTTOM_PLAYER_TOGGLE_SELECTORS)
+      }, { selectors: BOTTOM_PLAYER_TOGGLE_SELECTORS, requirePlaying: options.requirePlaying })
       .catch(() => false);
+  }
+
+  private async readBottomPlayerControlState(): Promise<string> {
+    if (!this.page) {
+      return "";
+    }
+
+    return await this.page
+      .evaluate((selectors: readonly string[]) => {
+        const player = document.querySelector("#g_player");
+        if (!player) {
+          return "";
+        }
+
+        const candidates = selectors.flatMap((selector) =>
+          Array.from(player.querySelectorAll<HTMLElement>(selector.replace(/^#g_player\s*/u, "")))
+        );
+        return candidates
+          .flatMap((element) => [
+            element.getAttribute("class"),
+            element.getAttribute("title"),
+            element.getAttribute("aria-label"),
+            element.textContent
+          ])
+          .filter(Boolean)
+          .join(" ");
+      }, BOTTOM_PLAYER_TOGGLE_SELECTORS)
+      .catch(() => "");
   }
 
   private async pauseHtmlMediaElements(): Promise<boolean> {
@@ -737,8 +934,12 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     }
 
     const domClicked = await this.page
-      .locator("#g_player")
-      .evaluate((player: Element) => {
+      .evaluate(() => {
+        const player = document.querySelector("#g_player");
+        if (!player) {
+          return false;
+        }
+
         const candidates = Array.from(
           player.querySelectorAll<HTMLElement>(".nxt, .btnc-nxt, [title='下一首']")
         );
@@ -764,10 +965,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       return "";
     }
 
-    return await this.page
-      .locator("#g_player")
-      .evaluate((player: Element) => (player.textContent ?? "").trim())
-      .catch(() => "");
+    return await this.page.evaluate(() => (document.querySelector("#g_player")?.textContent ?? "").trim()).catch(() => "");
   }
 
   private locatorFor(page: PageLike, selector: string): LocatorLike {
@@ -944,6 +1142,13 @@ export function resolveNeteaseLoginSurface(snapshot: NeteaseLoginSurfaceSnapshot
   return { state: "unknown" };
 }
 
+export function neteaseSnapshotHasLoginDialog(snapshot: NeteaseLoginSurfaceSnapshot): boolean {
+  return (
+    snapshot.loginModalCandidateCount > 0 ||
+    snapshot.loginModalTexts.some(neteaseTextLooksLikeExplicitLoginModal)
+  );
+}
+
 export function isNeteaseLoginRequiredError(error: unknown): boolean {
   return (
     error instanceof NeteaseLoginRequiredError ||
@@ -961,6 +1166,13 @@ export function neteaseSongIdFromUrl(url?: string): string | undefined {
 
 export function neteaseUrlContainsSongId(url: string, songId: string): boolean {
   return neteaseSongIdFromUrl(url) === songId;
+}
+
+function songRouteMatchesSelector(
+  selector: string,
+  routeState: { pageMatches: boolean; frameMatches: boolean }
+): boolean {
+  return selector.startsWith("frame:") ? routeState.frameMatches : routeState.pageMatches;
 }
 
 function normalizeNeteaseText(value: string): string {

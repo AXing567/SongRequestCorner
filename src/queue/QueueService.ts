@@ -3,10 +3,12 @@ import type { BotUser, HistoryItem, HistoryPage, QueueItem, Track } from "../dom
 import { InMemoryHistoryStore, type HistoryStore, type ListHistoryOptions } from "../history/HistoryStore.js";
 
 export class QueueService {
-  private pending: QueueItem[] = [];
+  private pending: QueueItem[];
   private current?: QueueItem;
 
-  constructor(private readonly historyStore: HistoryStore = new InMemoryHistoryStore()) {}
+  constructor(private readonly historyStore: HistoryStore = new InMemoryHistoryStore()) {
+    this.pending = historyStore.loadPendingQueue();
+  }
 
   enqueue(track: Track, requester: BotUser): { item: QueueItem; position: number } {
     const item: QueueItem = {
@@ -17,6 +19,7 @@ export class QueueService {
     };
 
     this.pending.push(item);
+    this.persistPending();
     return {
       item,
       position: this.pending.length + (this.current ? 1 : 0)
@@ -25,6 +28,7 @@ export class QueueService {
 
   next(): QueueItem | undefined {
     this.current = this.pending.shift();
+    this.persistPending();
     return this.current;
   }
 
@@ -72,6 +76,7 @@ export class QueueService {
     for (let index = this.pending.length - 1; index >= 0; index -= 1) {
       if (this.pending[index]?.requester.id === userId) {
         const [removed] = this.pending.splice(index, 1);
+        this.persistPending();
         return removed;
       }
     }
@@ -86,6 +91,7 @@ export class QueueService {
     }
 
     const [removed] = this.pending.splice(index, 1);
+    this.persistPending();
     return removed;
   }
 
@@ -102,16 +108,22 @@ export class QueueService {
 
     const [item] = this.pending.splice(index, 1);
     this.pending.splice(targetIndex, 0, item);
+    this.persistPending();
     return true;
   }
 
   clearPending(): number {
     const count = this.pending.length;
     this.pending = [];
+    this.persistPending();
     return count;
   }
 
   private recordHistory(item: QueueItem, playedAt: Date): void {
     this.historyStore.record(item, playedAt);
+  }
+
+  private persistPending(): void {
+    this.historyStore.savePendingQueue(this.pending);
   }
 }

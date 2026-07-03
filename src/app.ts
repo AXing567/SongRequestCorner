@@ -78,6 +78,7 @@ export async function startApp(config: AppConfig): Promise<void> {
     loginNotifier,
     player
   });
+  startPlayerWarmUp(player);
 
   await transport.start((message) =>
     handleIncomingMessage(
@@ -92,6 +93,16 @@ export async function startApp(config: AppConfig): Promise<void> {
       loginNotifier
     )
   );
+}
+
+function startPlayerWarmUp(player: PlayerAdapter): void {
+  if (!player.warmUp) {
+    return;
+  }
+
+  void Promise.resolve(player.warmUp()).catch((error) => {
+    console.warn(`[player] warm-up failed: ${errorMessage(error)}`);
+  });
 }
 
 function installGracefulShutdown(resources: {
@@ -233,4 +244,8 @@ async function safeReplyOrSend(
 function humanizeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return `操作失败：${message}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

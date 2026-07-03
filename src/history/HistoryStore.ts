@@ -20,11 +20,14 @@ export interface HistoryStore {
   list(options?: ListHistoryOptions): HistoryPage;
   find(id: string, now?: Date): HistoryItem | undefined;
   prune(now?: Date): number;
+  loadPendingQueue(): QueueItem[];
+  savePendingQueue(items: readonly QueueItem[]): void;
   close?(): void;
 }
 
 export class InMemoryHistoryStore implements HistoryStore {
   private history: HistoryItem[] = [];
+  private pendingQueue: QueueItem[] = [];
 
   record(item: QueueItem, playedAt = new Date()): HistoryItem {
     const historyItem: HistoryItem = {
@@ -70,6 +73,14 @@ export class InMemoryHistoryStore implements HistoryStore {
     this.history = this.history.filter((item) => item.playedAt.getTime() >= cutoff);
     return before - this.history.length;
   }
+
+  loadPendingQueue(): QueueItem[] {
+    return this.pendingQueue.map(copyQueueItem);
+  }
+
+  savePendingQueue(items: readonly QueueItem[]): void {
+    this.pendingQueue = items.map(copyQueueItem);
+  }
 }
 
 export class SqliteHistoryStore implements HistoryStore {
@@ -89,6 +100,14 @@ export class SqliteHistoryStore implements HistoryStore {
         played_at INTEGER NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at DESC);
+      CREATE TABLE IF NOT EXISTS pending_queue (
+        id TEXT PRIMARY KEY,
+        position INTEGER NOT NULL,
+        track_json TEXT NOT NULL,
+        requester_json TEXT NOT NULL,
+        requested_at INTEGER NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_pending_queue_position ON pending_queue(position ASC);
     `);
     this.prune();
   }
@@ -157,6 +176,38 @@ export class SqliteHistoryStore implements HistoryStore {
     const cutoff = now.getTime() - HISTORY_RETENTION_MS;
     const result = this.db.prepare(`DELETE FROM play_history WHERE played_at < ?`).run(cutoff);
     return Number(result.changes);
+  }
+
+  loadPendingQueue(): QueueItem[] {
+    return this.db
+      .prepare(`SELECT * FROM pending_queue ORDER BY position ASC, requested_at ASC`)
+      .all()
+      .map(rowToQueueItem);
+  }
+
+  savePendingQueue(items: readonly QueueItem[]): void {
+    const insert = this.db.prepare(
+      `INSERT INTO pending_queue (id, position, track_json, requester_json, requested_at)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare(`DELETE FROM pending_queue`).run();
+      items.forEach((item, index) => {
+        insert.run(
+          item.id,
+          index,
+          JSON.stringify(item.track),
+          JSON.stringify(item.requester),
+          item.requestedAt.getTime()
+        );
+      });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   close(): void {
@@ -243,5 +294,23 @@ function rowToHistoryItem(row: Record<string, unknown>): HistoryItem {
     requester: JSON.parse(String(row.requester_json)) as BotUser,
     requestedAt: new Date(Number(row.requested_at)),
     playedAt: new Date(Number(row.played_at))
+  };
+}
+
+function rowToQueueItem(row: Record<string, unknown>): QueueItem {
+  return {
+    id: String(row.id),
+    track: JSON.parse(String(row.track_json)) as Track,
+    requester: JSON.parse(String(row.requester_json)) as BotUser,
+    requestedAt: new Date(Number(row.requested_at))
+  };
+}
+
+function copyQueueItem(item: QueueItem): QueueItem {
+  return {
+    id: item.id,
+    track: { ...item.track },
+    requester: { ...item.requester },
+    requestedAt: new Date(item.requestedAt.getTime())
   };
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { InMemoryHistoryStore } from "../src/history/HistoryStore.js";
 import { QueueService } from "../src/queue/QueueService.js";
 
 function user(id = "u1") {
@@ -6,6 +7,32 @@ function user(id = "u1") {
 }
 
 describe("QueueService history", () => {
+  it("restores pending songs from the backing store after a service restart", () => {
+    const store = new InMemoryHistoryStore();
+    const first = new QueueService(store);
+
+    first.enqueue({ id: "1", title: "第一首", artist: "歌手", source: "mock" }, user("u1"));
+    first.enqueue({ id: "2", title: "第二首", artist: "歌手", source: "mock" }, user("u2"));
+
+    const restarted = new QueueService(store);
+
+    expect(restarted.listPending().map((item) => item.track.title)).toEqual(["第一首", "第二首"]);
+    expect(restarted.listPending().map((item) => item.requester.id)).toEqual(["u1", "u2"]);
+  });
+
+  it("updates the persisted pending queue when songs are reordered or removed", () => {
+    const store = new InMemoryHistoryStore();
+    const queue = new QueueService(store);
+    const first = queue.enqueue({ id: "1", title: "第一首", artist: "歌手", source: "mock" }, user()).item;
+    const second = queue.enqueue({ id: "2", title: "第二首", artist: "歌手", source: "mock" }, user()).item;
+    queue.enqueue({ id: "3", title: "第三首", artist: "歌手", source: "mock" }, user());
+
+    queue.movePending(second.id, "up");
+    queue.removePending(first.id);
+
+    expect(new QueueService(store).listPending().map((item) => item.track.title)).toEqual(["第二首", "第三首"]);
+  });
+
   it("records completed songs and can replay them into the queue", () => {
     const queue = new QueueService();
     const now = new Date();

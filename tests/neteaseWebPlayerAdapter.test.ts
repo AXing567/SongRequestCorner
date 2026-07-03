@@ -5,6 +5,7 @@ import {
   NeteaseWebPlayerAdapter,
   mergeNeteaseLoginSurfaceSnapshots,
   neteaseBottomPlayerControlLooksPlaying,
+  neteaseSnapshotHasLoginDialog,
   neteaseSongIdFromUrl,
   neteaseUrlContainsSongId,
   neteaseTextContainsTrackTitle,
@@ -121,6 +122,30 @@ describe("resolveNeteaseLoginSurface", () => {
   });
 });
 
+describe("neteaseSnapshotHasLoginDialog", () => {
+  it("only reports a login dialog when an explicit login modal is visible", () => {
+    expect(
+      neteaseSnapshotHasLoginDialog({
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [],
+        loginTexts: ["鐧诲綍"]
+      })
+    ).toBe(false);
+
+    expect(
+      neteaseSnapshotHasLoginDialog({
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["鎵爜鐧诲綍"],
+        loginTexts: []
+      })
+    ).toBe(true);
+  });
+});
+
 describe("NeteaseWebPlayerAdapter pause control", () => {
   it("uses a DOM fallback when the normal locator click cannot reach the bottom-player toggle", async () => {
     const page = new FakePage({ domToggleSucceeds: true });
@@ -141,6 +166,17 @@ describe("NeteaseWebPlayerAdapter pause control", () => {
   });
 });
 
+describe("NeteaseWebPlayerAdapter clear control", () => {
+  it("does not press the global media key when safely stopping old playback", async () => {
+    const page = new FakePage({ domToggleSucceeds: false });
+    const adapter = adapterWithPage(page);
+
+    await adapter.clear();
+
+    expect(page.keyboardPresses).toEqual([]);
+  });
+});
+
 describe("NeteaseWebPlayerAdapter login QR detection", () => {
   it("reuses the persistent NetEase login cookie after a restart", async () => {
     const page = new FakePage({
@@ -158,6 +194,7 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
 
     expect(status.state).toBe("logged_in");
     expect(page.loginEntryClicks).toBe(0);
+    expect(page.loginDialogCloseClicks).toBe(0);
   });
 
   it("closes a stale NetEase login dialog when the persistent login cookie is still valid", async () => {
@@ -296,6 +333,32 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
 });
 
 describe("NeteaseWebPlayerAdapter browser launch", () => {
+  it("warms up the persistent page without opening the login QR flow", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      loginEntryClicksBeforeSuccess: 1
+    });
+    let launchCalls = 0;
+    const adapter = new NeteaseWebPlayerAdapter({
+      userDataDir: "profile",
+      headless: true,
+      playwright: {
+        chromium: {
+          launchPersistentContext: async () => {
+            launchCalls += 1;
+            return new FakeBrowserContext(page, [{ name: "MUSIC_U", value: "persisted-session" }]);
+          }
+        }
+      }
+    } as any);
+
+    await adapter.warmUp();
+
+    expect(launchCalls).toBe(1);
+    expect(page.gotoCalls).toBe(1);
+    expect(page.loginEntryClicks).toBe(0);
+  });
+
   it("coalesces concurrent persistent browser launches for the shared profile", async () => {
     const page = new FakePage({ domToggleSucceeds: false });
     let releaseLaunch!: () => void;
@@ -357,6 +420,24 @@ describe("NeteaseWebPlayerAdapter browser launch", () => {
   });
 });
 
+describe("NeteaseWebPlayerAdapter fast song routing", () => {
+  it("routes song pages through the existing NetEase iframe without a full-page goto", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      routeInPlaceSucceeds: true
+    });
+    const adapter = adapterWithPage(page);
+    const item = queueItem("song-123", "Fast Route", "Tester");
+
+    await (adapter as any).navigateToSongPage(page, item);
+
+    expect(page.gotoCalls).toBe(0);
+    expect(page.routeInPlaceCalls).toBe(1);
+    expect(page.url()).toBe("https://music.163.com/#/song?id=123");
+    expect(page.frameUrl).toBe("https://music.163.com/song?id=123");
+  });
+});
+
 describe("NeteaseWebPlayerAdapter lifecycle", () => {
   it("closes the persistent browser context so the profile can flush to disk", async () => {
     const adapter = adapterWithPage(new FakePage({ domToggleSucceeds: false }));
@@ -387,9 +468,15 @@ class FakePage {
   loginEntryClicks = 0;
   loginDialogCloseClicks = 0;
   gotoCalls = 0;
+  routeInPlaceCalls = 0;
+  currentUrl = "https://music.163.com/";
+  frameUrl = "https://music.163.com/";
+  keyboardPresses: string[] = [];
   closed = false;
   keyboard = {
-    press: async () => undefined
+    press: async (key: string) => {
+      this.keyboardPresses.push(key);
+    }
   };
 
   constructor(
@@ -399,6 +486,7 @@ class FakePage {
       qrScreenshot?: Buffer;
       dialogScreenshot?: Buffer;
       loginEntryClicksBeforeSuccess?: number;
+      routeInPlaceSucceeds?: boolean;
       surfaceSnapshot?: {
         profileCandidateCount: number;
         profileTexts: string[];
@@ -414,6 +502,17 @@ class FakePage {
   }
 
   locator(selector: string): FakeLocator {
+    if (selector === "iframe#g_iframe") {
+      return new FakeLocator(() => "", {
+        evaluate: (_callback, targetSongId?: string) => {
+          if (targetSongId) {
+            this.frameUrl = `https://music.163.com/song?id=${targetSongId}`;
+          }
+          return undefined;
+        }
+      });
+    }
+
     if (selector === "#g_player") {
       return new FakeLocator(() => {
         this.domToggleAttempts += 1;
@@ -469,8 +568,13 @@ class FakePage {
     return new FakeLocator(() => "");
   }
 
-  async evaluate(callback?: () => unknown): Promise<boolean | unknown> {
-    if (callback?.toString().includes("profileCandidateCount")) {
+  url(): string {
+    return this.currentUrl;
+  }
+
+  async evaluate(callback?: () => unknown, targetSongId?: string): Promise<boolean | unknown> {
+    const source = callback?.toString() ?? "";
+    if (source.includes("profileCandidateCount")) {
       return this.options.surfaceSnapshot ?? {
         profileCandidateCount: 0,
         profileTexts: [],
@@ -480,13 +584,43 @@ class FakePage {
       };
     }
 
+    if (source.includes("#g_player")) {
+      if (source.includes("target.click")) {
+        this.domToggleAttempts += 1;
+        return this.options.domToggleSucceeds;
+      }
+
+      return "";
+    }
+
+    if (source.includes("iframe#g_iframe") && source.includes("window.location.hash")) {
+      this.routeInPlaceCalls += 1;
+      if (!this.options.routeInPlaceSucceeds || !targetSongId) {
+        return false;
+      }
+
+      this.currentUrl = `https://music.163.com/#/song?id=${targetSongId}`;
+      this.frameUrl = `https://music.163.com/song?id=${targetSongId}`;
+      return true;
+    }
+
+    if (source.includes("iframe#g_iframe")) {
+      if (targetSongId) {
+        this.frameUrl = `https://music.163.com/song?id=${targetSongId}`;
+      }
+      return undefined;
+    }
+
     return this.options.mediaPauseSucceeds ?? false;
   }
 
   async waitForTimeout(): Promise<void> {}
 
-  async goto(): Promise<void> {
+  async goto(url?: string): Promise<void> {
     this.gotoCalls += 1;
+    if (url) {
+      this.currentUrl = url;
+    }
   }
 
   async close(): Promise<void> {
@@ -502,6 +636,7 @@ class FakeLocator {
       screenshot?: Buffer;
       width?: number;
       height?: number;
+      evaluate?: (callback?: (...args: any[]) => unknown, ...args: any[]) => unknown;
     } = {}
   ) {}
 
@@ -527,7 +662,11 @@ class FakeLocator {
     return "";
   }
 
-  async evaluate(): Promise<unknown> {
+  async evaluate(callback?: (...args: any[]) => unknown, ...args: any[]): Promise<unknown> {
+    if (this.options.evaluate) {
+      return this.options.evaluate(callback, ...args);
+    }
+
     return this.evaluateResult();
   }
 
@@ -578,6 +717,21 @@ class FakeBrowserContext {
   async cookies(): Promise<Array<{ name: string; value: string }>> {
     return this.storedCookies;
   }
+}
+
+function queueItem(id: string, title: string, artist: string): QueueItem {
+  return {
+    id: `queue-${id}`,
+    track: {
+      id,
+      title,
+      artist,
+      source: "netease",
+      sourceUrl: `https://music.163.com/#/song?id=${id.replace(/\D/gu, "")}`
+    },
+    requester: { id: "u1", role: "employee" },
+    requestedAt: new Date()
+  };
 }
 
 function adapterWithPage(page: FakePage): NeteaseWebPlayerAdapter {
