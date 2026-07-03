@@ -56,6 +56,8 @@ describe("resolveNeteaseLoginSurface", () => {
       resolveNeteaseLoginSurface({
         profileCandidateCount: 1,
         profileTexts: ["Alice 个人主页 设置 退出"],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [],
         loginTexts: []
       })
     ).toEqual({ state: "logged_in", accountName: "Alice" });
@@ -66,24 +68,53 @@ describe("resolveNeteaseLoginSurface", () => {
       resolveNeteaseLoginSurface({
         profileCandidateCount: 1,
         profileTexts: ["Alice"],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [],
         loginTexts: ["登录"]
       })
     ).toEqual({ state: "logged_in", accountName: "Alice" });
   });
 
-  it("detects a visible login entry without treating normal navigation as login", () => {
+  it("does not treat a generic login entry as a lost session", () => {
     expect(
       resolveNeteaseLoginSurface({
         profileCandidateCount: 0,
         profileTexts: [],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [],
         loginTexts: ["发现音乐", "我的音乐", "登录"]
+      })
+    ).toEqual({ state: "unknown" });
+  });
+
+  it("detects the explicit NetEase QR login modal", () => {
+    expect(
+      resolveNeteaseLoginSurface({
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["登录 登录获取更懂你的好音乐 扫码登录"],
+        loginTexts: ["登录"]
       })
     ).toEqual({ state: "login_required" });
   });
+
   it("merges login surface snapshots from page frames", () => {
     const snapshot = mergeNeteaseLoginSurfaceSnapshots([
-      { profileCandidateCount: 0, profileTexts: [], loginTexts: [] },
-      { profileCandidateCount: 0, profileTexts: [], loginTexts: ["login"] }
+      {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [],
+        loginTexts: []
+      },
+      {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["扫码登录"],
+        loginTexts: ["login"]
+      }
     ]);
 
     expect(resolveNeteaseLoginSurface(snapshot)).toEqual({ state: "login_required" });
@@ -111,6 +142,67 @@ describe("NeteaseWebPlayerAdapter pause control", () => {
 });
 
 describe("NeteaseWebPlayerAdapter login QR detection", () => {
+  it("reuses the persistent NetEase login cookie after a restart", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      loginEntryClicksBeforeSuccess: 1,
+      dialogScreenshot: Buffer.from("dialog")
+    });
+    const adapter = adapterWithPage(page);
+    adapterInternals(adapter).current = undefined;
+    adapterInternals(adapter).context = new FakeBrowserContext(undefined, [
+      { name: "MUSIC_U", value: "persisted-session" }
+    ]);
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status.state).toBe("logged_in");
+    expect(page.loginEntryClicks).toBe(0);
+  });
+
+  it("closes a stale NetEase login dialog when the persistent login cookie is still valid", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      surfaceSnapshot: {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["登录获取更懂你的好音乐 扫码登录"],
+        loginTexts: ["登录"]
+      }
+    });
+    const adapter = adapterWithPage(page);
+    adapterInternals(adapter).current = undefined;
+    adapterInternals(adapter).context = new FakeBrowserContext(undefined, [
+      { name: "MUSIC_U", value: "persisted-session" }
+    ]);
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status.state).toBe("logged_in");
+    expect(page.loginDialogCloseClicks).toBe(1);
+  });
+
+  it("closes a stale NetEase login dialog when the page avatar is already visible", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      surfaceSnapshot: {
+        profileCandidateCount: 1,
+        profileTexts: ["Alice 个人主页"],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["登录获取更懂你的好音乐 扫码登录"],
+        loginTexts: ["登录"]
+      }
+    });
+    const adapter = adapterWithPage(page);
+    adapterInternals(adapter).current = undefined;
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status).toEqual({ state: "logged_in", accountName: "Alice" });
+    expect(page.loginDialogCloseClicks).toBe(1);
+  });
+
   it("does not open a login QR when the page login state is unknown", async () => {
     const page = new FakePage({
       domToggleSucceeds: false,
@@ -126,7 +218,7 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
     expect(page.loginEntryClicks).toBe(0);
   });
 
-  it("returns login_required when the page state is unknown but a QR is already visible", async () => {
+  it("ignores broad non-modal QR candidates when the login state is unknown", async () => {
     const page = new FakePage({
       domToggleSucceeds: false,
       qrScreenshot: Buffer.from("qr")
@@ -136,8 +228,8 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
 
     const status = await adapter.getLoginStatus();
 
-    expect(status.state).toBe("login_required");
-    expect(status.qrCode?.data.toString()).toBe("qr");
+    expect(status.state).toBe("unknown");
+    expect(status.qrCode).toBeUndefined();
   });
 
   it("falls back to sending the login dialog screenshot when no QR candidate is found", async () => {
@@ -146,6 +238,8 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
       surfaceSnapshot: {
         profileCandidateCount: 0,
         profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["登录获取更懂你的好音乐 扫码登录"],
         loginTexts: ["登录"]
       },
       loginEntryClicksBeforeSuccess: 1,
@@ -158,7 +252,7 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
 
     expect(status.state).toBe("login_required");
     expect(status.qrCode?.data.toString()).toBe("dialog");
-    expect(page.loginEntryClicks).toBeGreaterThanOrEqual(1);
+    expect(page.loginEntryClicks).toBe(0);
   });
 
   it("opens the login QR in a temporary page when a browser context is available", async () => {
@@ -167,6 +261,8 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
       surfaceSnapshot: {
         profileCandidateCount: 0,
         profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["登录获取更懂你的好音乐 扫码登录"],
         loginTexts: ["登录"]
       },
       loginEntryClicksBeforeSuccess: 1,
@@ -177,6 +273,8 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
       surfaceSnapshot: {
         profileCandidateCount: 0,
         profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["登录获取更懂你的好音乐 扫码登录"],
         loginTexts: ["登录"]
       },
       loginEntryClicksBeforeSuccess: 1,
@@ -192,8 +290,70 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
     expect(status.qrCode?.data.toString()).toBe("isolated-dialog");
     expect(mainPage.loginEntryClicks).toBe(0);
     expect(loginPage.gotoCalls).toBe(1);
-    expect(loginPage.loginEntryClicks).toBeGreaterThanOrEqual(1);
+    expect(loginPage.loginEntryClicks).toBe(0);
     expect(loginPage.closed).toBe(true);
+  });
+});
+
+describe("NeteaseWebPlayerAdapter browser launch", () => {
+  it("coalesces concurrent persistent browser launches for the shared profile", async () => {
+    const page = new FakePage({ domToggleSucceeds: false });
+    let releaseLaunch!: () => void;
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    let launchCalls = 0;
+    const adapter = new NeteaseWebPlayerAdapter({
+      userDataDir: "profile",
+      headless: true,
+      playwright: {
+        chromium: {
+          launchPersistentContext: async () => {
+            launchCalls += 1;
+            await launchGate;
+            return new FakeBrowserContext(page);
+          }
+        }
+      }
+    } as any);
+
+    const firstPage = (adapter as any).ensurePage() as Promise<FakePage>;
+    const secondPage = (adapter as any).ensurePage() as Promise<FakePage>;
+    releaseLaunch();
+
+    await expect(Promise.all([firstPage, secondPage])).resolves.toEqual([page, page]);
+    expect(launchCalls).toBe(1);
+    expect(page.gotoCalls).toBe(1);
+  });
+
+  it("turns Chrome profile lock failures into a clear retryable error", async () => {
+    const page = new FakePage({ domToggleSucceeds: false });
+    let launchShouldFail = true;
+    let launchCalls = 0;
+    const adapter = new NeteaseWebPlayerAdapter({
+      userDataDir: "C:\\music\\netease-profile",
+      headless: true,
+      playwright: {
+        chromium: {
+          launchPersistentContext: async () => {
+            launchCalls += 1;
+            if (launchShouldFail) {
+              throw new Error(
+                "browserType.launchPersistentContext: Target page, context or browser has been closed\n[pid][out] 正在现有的浏览器会话中打开。\n--user-data-dir=C:\\music\\netease-profile"
+              );
+            }
+
+            return new FakeBrowserContext(page);
+          }
+        }
+      }
+    } as any);
+
+    await expect((adapter as any).ensurePage()).rejects.toThrow("浏览器配置目录正在被另一个 Chrome 会话占用");
+
+    launchShouldFail = false;
+    await expect((adapter as any).ensurePage()).resolves.toBe(page);
+    expect(launchCalls).toBe(2);
   });
 });
 
@@ -225,6 +385,7 @@ describe("NetEase song URL helpers", () => {
 class FakePage {
   domToggleAttempts = 0;
   loginEntryClicks = 0;
+  loginDialogCloseClicks = 0;
   gotoCalls = 0;
   closed = false;
   keyboard = {
@@ -241,6 +402,8 @@ class FakePage {
       surfaceSnapshot?: {
         profileCandidateCount: number;
         profileTexts: string[];
+        loginModalCandidateCount: number;
+        loginModalTexts: string[];
         loginTexts: string[];
       };
     }
@@ -258,20 +421,40 @@ class FakePage {
       });
     }
 
+    if (
+      selector.includes("zcls") ||
+      selector.includes("关闭") ||
+      selector.includes("has-text('×')") ||
+      selector.includes('has-text("×")')
+    ) {
+      return new FakeLocator(() => "", {
+        click: () => {
+          this.loginDialogCloseClicks += 1;
+          return true;
+        }
+      });
+    }
+
+    if (
+      selector.includes("mrc-modal-container") ||
+      selector.includes("page_web_register_login") ||
+      selector.includes("mod_web_qr_code_login")
+    ) {
+      const isQrImageSelector =
+        selector.includes(" img") || selector.includes("canvas") || selector.includes("._2SF8rF8D");
+      return new FakeLocator(() => "", {
+        screenshot: isQrImageSelector ? this.options.qrScreenshot : this.options.dialogScreenshot,
+        width: isQrImageSelector ? 88 : 180,
+        height: isQrImageSelector ? 88 : 180
+      });
+    }
+
     if (selector.includes("has-text")) {
       return new FakeLocator(() => "", {
         click: () => {
           this.loginEntryClicks += 1;
           return this.loginEntryClicks <= (this.options.loginEntryClicksBeforeSuccess ?? 0);
         }
-      });
-    }
-
-    if (selector === ".m-layer") {
-      return new FakeLocator(() => "", {
-        screenshot: this.options.dialogScreenshot,
-        width: 180,
-        height: 180
       });
     }
 
@@ -291,6 +474,8 @@ class FakePage {
       return this.options.surfaceSnapshot ?? {
         profileCandidateCount: 0,
         profileTexts: [],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [],
         loginTexts: []
       };
     }
@@ -373,14 +558,25 @@ class FakeLocator {
 class FakeBrowserContext {
   closed = false;
 
-  constructor(private readonly nextPage?: FakePage) {}
+  constructor(
+    private readonly nextPage?: FakePage,
+    private readonly storedCookies: Array<{ name: string; value: string }> = []
+  ) {}
 
   async close(): Promise<void> {
     this.closed = true;
   }
 
+  pages(): FakePage[] {
+    return this.nextPage ? [this.nextPage] : [];
+  }
+
   async newPage(): Promise<FakePage> {
     return this.nextPage ?? new FakePage({ domToggleSucceeds: false });
+  }
+
+  async cookies(): Promise<Array<{ name: string; value: string }>> {
+    return this.storedCookies;
   }
 }
 

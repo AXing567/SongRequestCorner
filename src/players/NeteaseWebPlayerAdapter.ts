@@ -5,6 +5,7 @@ interface NeteaseWebPlayerOptions {
   userDataDir: string;
   headless: boolean;
   executablePath?: string;
+  playwright?: any;
 }
 
 type PageLike = any;
@@ -13,6 +14,8 @@ type LocatorLike = any;
 export interface NeteaseLoginSurfaceSnapshot {
   profileCandidateCount: number;
   profileTexts: string[];
+  loginModalCandidateCount: number;
+  loginModalTexts: string[];
   loginTexts: string[];
 }
 
@@ -40,62 +43,39 @@ const BOTTOM_PLAYER_TOGGLE_SELECTORS = [
   ".btnc-ply"
 ] as const;
 
-const LOGIN_ENTRY_SELECTORS = [
-  "#g-topbar a:has-text('登录')",
-  "#g_topbar a:has-text('登录')",
-  ".m-tophead a:has-text('登录')",
-  "a.link.s-fc3:has-text('登录')",
-  "a:has-text('登录')",
-  "button:has-text('登录')",
-  "[role='button']:has-text('登录')",
-  "[class*='login']:has-text('登录')",
-  "[class*='Login']:has-text('登录')"
-] as const;
-
 const LOGIN_QR_SELECTORS = [
-  ".m-layer img[src*='qr']",
-  ".m-layer img[src*='QRCode']",
-  ".m-layer img[src*='qrcode']",
-  ".m-layer img[src*='unikey']",
-  ".m-layer img[src*='login']",
-  ".m-layer [class*='qr'] img",
-  ".m-layer [class*='QR'] img",
-  ".m-layer [class*='code'] img",
-  ".m-layer [class*='Code'] img",
-  ".m-layer canvas",
-  "[class*='login'] img[src*='qr']",
-  "[class*='login'] img[src*='qrcode']",
-  "[class*='login'] img[src*='QRCode']",
-  "[class*='login'] img[src*='unikey']",
-  "[class*='login'] [class*='qr'] img",
-  "[class*='login'] [class*='code'] img",
-  "[class*='login'] canvas",
-  "[class*='Login'] img[src*='qr']",
-  "[class*='Login'] [class*='qr'] img",
-  "[class*='Login'] canvas",
-  "[class*='scan'] img",
-  "[class*='scan'] canvas",
-  "[class*='Scan'] img",
-  "[class*='Scan'] canvas",
-  "[class*='code'] img",
-  "[class*='Code'] img",
-  "img[src*='qr']",
-  "img[src*='qrcode']",
-  "img[src*='QRCode']",
-  "img[src*='unikey']",
-  "canvas"
+  ".mrc-modal-container[role='dialog'] [data-log*='mod_web_qr_code_login'] img[src^='data:image']",
+  ".mrc-modal-container[role='dialog'] [data-log*='mod_web_qr_code_login'] img",
+  ".mrc-modal-container[role='dialog'] ._2SF8rF8D img[src^='data:image']",
+  ".mrc-modal-container[role='dialog'] ._2SF8rF8D img",
+  ".mrc-modal-container[role='dialog'] canvas",
+  ".m-layer:has-text('登录获取更懂你的好音乐') img[src^='data:image']",
+  ".m-layer:has-text('登录获取更懂你的好音乐') canvas",
+  "[data-log*='mod_web_qr_code_login'] img[src^='data:image']",
+  "[data-log*='mod_web_qr_code_login'] img",
+  "[data-log*='mod_web_qr_code_login'] canvas"
 ] as const;
 
 const LOGIN_DIALOG_SELECTORS = [
-  ".m-layer",
-  "[class*='login']",
-  "[class*='Login']",
-  "[class*='qr']",
-  "[class*='QR']",
-  "[class*='scan']",
-  "[class*='Scan']",
-  "[class*='code']",
-  "[class*='Code']"
+  ".mrc-modal-container[role='dialog']:has-text('登录获取更懂你的好音乐')",
+  ".mrc-modal-container[role='dialog']:has-text('扫码登录')",
+  ".m-layer:has-text('登录获取更懂你的好音乐')",
+  ".m-layer:has-text('扫码登录')",
+  "[data-log*='page_web_register_login']",
+  "[data-log*='mod_web_qr_code_login']"
+] as const;
+
+const LOGIN_DIALOG_CLOSE_SELECTORS = [
+  ".mrc-modal-container[role='dialog'] [aria-label*='关闭']",
+  ".mrc-modal-container[role='dialog'] [title*='关闭']",
+  ".mrc-modal-container[role='dialog'] button:has-text('×')",
+  ".mrc-modal-container[role='dialog'] span:has-text('×')",
+  ".m-layer .zcls",
+  ".m-layer [title*='关闭']",
+  "[role='dialog'] [aria-label*='关闭']",
+  "[role='dialog'] [title*='关闭']",
+  "[role='dialog'] button:has-text('×')",
+  "[role='dialog'] span:has-text('×')"
 ] as const;
 
 export class NeteaseLoginRequiredError extends Error {
@@ -108,6 +88,7 @@ export class NeteaseLoginRequiredError extends Error {
 export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
   private page?: PageLike;
   private context?: any;
+  private pageLaunchInFlight?: Promise<PageLike>;
   private current?: QueueItem;
   private paused = false;
 
@@ -120,6 +101,10 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       return { state: "logged_in", accountName: surface.accountName };
     }
 
+    if (surface.state === "unknown") {
+      return { state: "unknown" };
+    }
+
     const existingQrCode = await this.screenshotLoginQrCandidate(page);
     if (existingQrCode) {
       return {
@@ -127,10 +112,6 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
         qrCode: existingQrCode,
         reason: "NetEase web session is not logged in."
       };
-    }
-
-    if (surface.state === "unknown") {
-      return { state: "unknown" };
     }
 
     const qrCode = await this.openLoginQrCodeInTemporaryPage(page);
@@ -258,20 +239,46 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
   }
 
   private async ensurePage(): Promise<PageLike> {
-    if (this.page) {
+    if (this.page && !this.page.isClosed?.()) {
       return this.page;
     }
 
-    const playwright = await importOptionalPlaywright();
-    this.context = await playwright.chromium.launchPersistentContext(this.options.userDataDir, {
-      headless: this.options.headless,
-      executablePath: this.options.executablePath,
-      viewport: { width: 1280, height: 800 },
-      args: ["--autoplay-policy=no-user-gesture-required"]
+    this.page = undefined;
+    if (this.pageLaunchInFlight) {
+      return this.pageLaunchInFlight;
+    }
+
+    this.pageLaunchInFlight = this.launchPersistentPage().finally(() => {
+      this.pageLaunchInFlight = undefined;
     });
-    this.page = this.context.pages()[0] ?? (await this.context.newPage());
-    await this.page.goto("https://music.163.com/", { waitUntil: "domcontentloaded" });
-    return this.page;
+    return this.pageLaunchInFlight;
+  }
+
+  private async launchPersistentPage(): Promise<PageLike> {
+    let context: any;
+    try {
+      const playwright = this.options.playwright ?? (await importOptionalPlaywright());
+      context = await playwright.chromium.launchPersistentContext(this.options.userDataDir, {
+        headless: this.options.headless,
+        executablePath: this.options.executablePath,
+        viewport: { width: 1280, height: 800 },
+        args: ["--autoplay-policy=no-user-gesture-required"]
+      });
+      const page = context.pages()[0] ?? (await context.newPage());
+      await page.goto("https://music.163.com/", { waitUntil: "domcontentloaded" });
+      this.context = context;
+      this.page = page;
+      return page;
+    } catch (error) {
+      try {
+        await context?.close?.();
+      } catch {
+        // Ignore cleanup failures while normalizing the original launch error.
+      }
+      this.context = undefined;
+      this.page = undefined;
+      throw normalizeNeteaseBrowserLaunchError(error, this.options.userDataDir);
+    }
   }
 
   private async assertLoggedInForPlayback(page: PageLike): Promise<void> {
@@ -285,8 +292,34 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     const snapshots = await Promise.all(
       this.locatorSurfaces(page).map((surface) => readNeteaseLoginSurfaceSnapshot(surface))
     );
+    const domSurface = resolveNeteaseLoginSurface(mergeNeteaseLoginSurfaceSnapshots(snapshots));
+    const cookieSurface = await this.readCookieLoginSurface();
 
-    return resolveNeteaseLoginSurface(mergeNeteaseLoginSurfaceSnapshots(snapshots));
+    if (cookieSurface?.state === "logged_in" || domSurface.state === "logged_in") {
+      await this.dismissStaleLoginDialog(page);
+      if (domSurface.state === "logged_in") {
+        return domSurface;
+      }
+
+      return cookieSurface ?? { state: "unknown" };
+    }
+
+    return domSurface;
+  }
+
+  private async readCookieLoginSurface(): Promise<NeteaseLoginSurface | undefined> {
+    if (!this.context || typeof this.context.cookies !== "function") {
+      return undefined;
+    }
+
+    const cookies = await this.context
+      .cookies(["https://music.163.com/", "https://interface.music.163.com/"])
+      .catch(() => []);
+    const musicUserCookie = cookies.find(
+      (cookie: { name?: string; value?: string }) => cookie.name === "MUSIC_U" && Boolean(cookie.value)
+    );
+
+    return musicUserCookie ? { state: "logged_in" } : undefined;
   }
 
   private async readLoginSurfaceAfterSettling(page: PageLike): Promise<NeteaseLoginSurface> {
@@ -312,14 +345,17 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       return undefined;
     }
 
+    if (surface.state === "unknown") {
+      return undefined;
+    }
+
     const existingQrCode = await this.screenshotLoginQrCandidate(page);
     if (existingQrCode) {
       return existingQrCode;
     }
 
-    await this.clickLoginEntry(page);
-    await page.waitForTimeout(500).catch(() => undefined);
     await this.clickQrLoginTab(page);
+    await this.refreshLoginQrCode(page);
 
     for (let attempt = 0; attempt < 24; attempt += 1) {
       const qrCode = await this.screenshotLoginQrCandidate(page);
@@ -342,7 +378,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     try {
       loginPage = await this.context.newPage();
       await loginPage.goto("https://music.163.com/", { waitUntil: "domcontentloaded" });
-      return await this.openLoginQrCode(loginPage);
+      return (await this.openLoginQrCode(loginPage)) ?? (await this.openLoginQrCode(fallbackPage));
     } catch (error) {
       console.warn(`[netease-web] failed to open isolated login page: ${errorMessage(error)}`);
       return await this.openLoginQrCode(fallbackPage);
@@ -351,53 +387,48 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     }
   }
 
-  private async clickLoginEntry(page: PageLike): Promise<void> {
-    for (const surface of this.locatorSurfaces(page)) {
-      if (await this.clickFirst(surface, LOGIN_ENTRY_SELECTORS, false)) {
-        return;
-      }
-
-      const clicked = await surface
-        .evaluate(() => {
-          const visible = (element: HTMLElement): boolean => {
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-          };
-          const candidates = Array.from(document.querySelectorAll<HTMLElement>("#g-topbar a, #g_topbar a, .m-tophead a, a"));
-          const target = candidates.find(
-            (candidate) => visible(candidate) && /\u767b\u5f55|login/iu.test(candidate.textContent ?? candidate.title ?? "")
-          );
-          target?.click();
-          return Boolean(target);
-        })
-        .catch(() => false);
-
-      if (clicked) {
-        return;
-      }
-    }
-  }
-
   private async clickQrLoginTab(page: PageLike): Promise<void> {
     for (const surface of this.locatorSurfaces(page)) {
       for (const selector of [
-        ".m-layer a:has-text('\u626b\u7801')",
-        ".m-layer a:has-text('\u4e8c\u7ef4\u7801')",
-        ".m-layer button:has-text('\u626b\u7801')",
-        ".m-layer button:has-text('\u4e8c\u7ef4\u7801')",
-        ".m-layer [role='button']:has-text('\u626b\u7801')",
-        ".m-layer [role='button']:has-text('\u4e8c\u7ef4\u7801')",
-        "[class*='login'] a:has-text('\u626b\u7801')",
-        "[class*='login'] a:has-text('\u4e8c\u7ef4\u7801')",
-        "[class*='login'] button:has-text('\u626b\u7801')",
-        "[class*='login'] button:has-text('\u4e8c\u7ef4\u7801')",
-        "[class*='login'] [role='button']:has-text('\u626b\u7801')",
-        "[class*='login'] [role='button']:has-text('\u4e8c\u7ef4\u7801')"
+        ".mrc-modal-container[role='dialog'] a:has-text('\u626b\u7801')",
+        ".mrc-modal-container[role='dialog'] a:has-text('\u4e8c\u7ef4\u7801')",
+        ".mrc-modal-container[role='dialog'] button:has-text('\u626b\u7801')",
+        ".mrc-modal-container[role='dialog'] button:has-text('\u4e8c\u7ef4\u7801')",
+        ".mrc-modal-container[role='dialog'] [role='button']:has-text('\u626b\u7801')",
+        ".mrc-modal-container[role='dialog'] [role='button']:has-text('\u4e8c\u7ef4\u7801')",
+        "[data-log*='page_web_register_login'] a:has-text('\u626b\u7801')",
+        "[data-log*='page_web_register_login'] a:has-text('\u4e8c\u7ef4\u7801')",
+        "[data-log*='page_web_register_login'] button:has-text('\u626b\u7801')",
+        "[data-log*='page_web_register_login'] button:has-text('\u4e8c\u7ef4\u7801')"
       ]) {
         if (await this.tryClick(surface.locator(selector).first(), 500)) {
           return;
         }
+      }
+    }
+  }
+
+  private async refreshLoginQrCode(page: PageLike): Promise<void> {
+    for (const surface of this.locatorSurfaces(page)) {
+      for (const selector of [
+        ".mrc-modal-container[role='dialog'] a:has-text('\u70b9\u51fb\u5237\u65b0')",
+        ".mrc-modal-container[role='dialog'] button:has-text('\u70b9\u51fb\u5237\u65b0')",
+        "[data-log*='mod_web_qr_code_login'] a:has-text('\u70b9\u51fb\u5237\u65b0')",
+        "[data-log*='mod_web_qr_code_login'] button:has-text('\u70b9\u51fb\u5237\u65b0')"
+      ]) {
+        if (await this.tryClick(surface.locator(selector).first(), 500)) {
+          await page.waitForTimeout(500).catch(() => undefined);
+          return;
+        }
+      }
+    }
+  }
+
+  private async dismissStaleLoginDialog(page: PageLike): Promise<void> {
+    for (const surface of this.locatorSurfaces(page)) {
+      if (await this.clickFirst(surface, LOGIN_DIALOG_CLOSE_SELECTORS, false)) {
+        await page.waitForTimeout(150).catch(() => undefined);
+        return;
       }
     }
   }
@@ -781,6 +812,22 @@ async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<Netea
         ]
           .filter(Boolean)
           .join(" ");
+      const dataLogFor = (element: Element): string =>
+        [
+          element.getAttribute("data-log"),
+          ...Array.from(element.querySelectorAll("[data-log]")).map((child) => child.getAttribute("data-log"))
+        ]
+          .filter(Boolean)
+          .join(" ");
+      const looksLikeLoginModal = (element: Element): boolean => {
+        const text = textFor(element);
+        const dataLog = dataLogFor(element);
+        return (
+          dataLog.includes("page_web_register_login") ||
+          dataLog.includes("mod_web_qr_code_login") ||
+          (text.includes("登录获取更懂你的好音乐") && text.includes("扫码登录"))
+        );
+      };
 
       const profileElements = Array.from(
         document.querySelectorAll(
@@ -807,6 +854,18 @@ async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<Netea
           ].join(",")
         )
       ).filter(visible);
+      const loginModalElements = Array.from(
+        document.querySelectorAll(
+          [
+            ".mrc-modal-container[role='dialog']",
+            ".mrc-modal-appear-done .mrc-modal-container[role='dialog']",
+            ".mrc-modal-enter-done .mrc-modal-container[role='dialog']",
+            ".m-layer",
+            "[data-log*='page_web_register_login']",
+            "[data-log*='mod_web_qr_code_login']"
+          ].join(",")
+        )
+      ).filter((element) => visible(element) && looksLikeLoginModal(element));
       const loginElements = Array.from(
         document.querySelectorAll(
           [
@@ -827,6 +886,8 @@ async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<Netea
       return {
         profileCandidateCount: profileElements.length,
         profileTexts: profileElements.map(textFor),
+        loginModalCandidateCount: loginModalElements.length,
+        loginModalTexts: loginModalElements.map(textFor),
         loginTexts: loginElements.map(textFor)
       };
     })
@@ -837,6 +898,8 @@ function emptyNeteaseLoginSurfaceSnapshot(): NeteaseLoginSurfaceSnapshot {
   return {
     profileCandidateCount: 0,
     profileTexts: [],
+    loginModalCandidateCount: 0,
+    loginModalTexts: [],
     loginTexts: []
   };
 }
@@ -847,6 +910,11 @@ export function mergeNeteaseLoginSurfaceSnapshots(
   return {
     profileCandidateCount: snapshots.reduce((count, snapshot) => count + snapshot.profileCandidateCount, 0),
     profileTexts: snapshots.flatMap((snapshot) => snapshot.profileTexts),
+    loginModalCandidateCount: snapshots.reduce(
+      (count, snapshot) => count + snapshot.loginModalCandidateCount,
+      0
+    ),
+    loginModalTexts: snapshots.flatMap((snapshot) => snapshot.loginModalTexts),
     loginTexts: snapshots.flatMap((snapshot) => snapshot.loginTexts)
   };
 }
@@ -866,7 +934,10 @@ export function resolveNeteaseLoginSurface(snapshot: NeteaseLoginSurfaceSnapshot
     return { state: "logged_in", accountName };
   }
 
-  if (snapshot.loginTexts.some(neteaseTextLooksLikeLoginEntry)) {
+  if (
+    snapshot.loginModalCandidateCount > 0 ||
+    snapshot.loginModalTexts.some(neteaseTextLooksLikeExplicitLoginModal)
+  ) {
     return { state: "login_required" };
   }
 
@@ -914,6 +985,34 @@ function cleanNeteaseAccountName(value: string): string | undefined {
 
 function neteaseTextLooksLikeLoginEntry(value: string): boolean {
   return /登录|login/iu.test(value);
+}
+
+function neteaseTextLooksLikeExplicitLoginModal(value: string): boolean {
+  return (
+    value.includes("登录获取更懂你的好音乐") ||
+    value.includes("扫码登录") ||
+    value.includes("page_web_register_login") ||
+    value.includes("mod_web_qr_code_login")
+  );
+}
+
+function normalizeNeteaseBrowserLaunchError(error: unknown, userDataDir: string): Error {
+  const message = errorMessage(error);
+  if (neteaseBrowserLaunchLooksProfileLocked(message)) {
+    return new Error(
+      `无法启动网易云播放浏览器：浏览器配置目录正在被另一个 Chrome 会话占用（${userDataDir}）。请关闭之前由点歌系统打开的网易云 Chrome 窗口，或在任务管理器结束命令行包含 netease-profile 的 chrome.exe 后重试。`
+    );
+  }
+
+  return error instanceof Error ? error : new Error(message);
+}
+
+function neteaseBrowserLaunchLooksProfileLocked(message: string): boolean {
+  return (
+    /launchPersistentContext|Target page, context or browser has been closed|existing browser session|现有的浏览器会话|�������е�������Ự�д�/iu.test(
+      message
+    ) && /user-data-dir|netease-profile|existing browser session|现有的浏览器会话|�������е�������Ự�д�/iu.test(message)
+  );
 }
 
 async function importOptionalPlaywright(): Promise<any> {
