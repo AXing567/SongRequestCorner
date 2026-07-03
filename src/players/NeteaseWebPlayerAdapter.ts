@@ -83,6 +83,14 @@ const SONG_PAGE_READY_TIMEOUT_MS = 4_000;
 const PLAYBACK_SIGNAL_TIMEOUT_MS = 5_000;
 const PLAYBACK_POLL_INTERVAL_MS = 125;
 const FAST_CONTROL_TIMEOUT_MS = 350;
+const NETEASE_EXPLICIT_LOGIN_PROMPTS = [
+  "\u767b\u5f55\u83b7\u53d6\u66f4\u61c2\u4f60\u7684\u597d\u97f3\u4e50",
+  "\u626b\u7801\u767b\u5f55",
+  "\u9009\u62e9\u5176\u4ed6\u767b\u5f55\u6a21\u5f0f",
+  "\u4f7f\u7528 \u7f51\u6613\u4e91\u97f3\u4e50APP",
+  "\u70b9\u51fb\u5237\u65b0",
+  "\u52a0\u8f7d\u5931\u8d25"
+] as const;
 
 export class NeteaseLoginRequiredError extends Error {
   constructor(message = "网易云登录状态已失效，需要扫码登录后再播放。") {
@@ -695,7 +703,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
     }
 
     const loginSurface = await this.readLoginSurface(page);
-    if (loginSurface.state === "login_required") {
+    if (loginSurface.state === "login_required" || (await this.pageShowsExplicitLoginPrompt(page))) {
       throw new NeteaseLoginRequiredError();
     }
 
@@ -747,6 +755,64 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
   private async clickAny(page: PageLike, selectors: readonly string[], timeoutMs = 900): Promise<boolean> {
     const attempts = selectors.map((selector) => this.tryClick(this.locatorFor(page, selector), timeoutMs));
     return (await Promise.all(attempts)).some(Boolean);
+  }
+
+  private async pageShowsExplicitLoginPrompt(page: PageLike): Promise<boolean> {
+    const checks = await Promise.all(
+      this.locatorSurfaces(page).map((surface) =>
+        surface
+          .evaluate((explicitLoginPrompts: readonly string[]) => {
+            const visible = (element: Element): boolean => {
+              const style = window.getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+            };
+            const textFor = (element: Element): string =>
+              [
+                element.textContent,
+                element.getAttribute("title"),
+                element.getAttribute("aria-label"),
+                element.getAttribute("alt")
+              ]
+                .filter(Boolean)
+                .join(" ");
+            const dataLogFor = (element: Element): string =>
+              [
+                element.getAttribute("data-log"),
+                ...Array.from(element.querySelectorAll("[data-log]")).map((child) => child.getAttribute("data-log"))
+              ]
+                .filter(Boolean)
+                .join(" ");
+            const looksLikeExplicitLoginPrompt = (element: Element): boolean => {
+              const text = textFor(element);
+              const dataLog = dataLogFor(element);
+              return (
+                dataLog.includes("page_web_register_login") ||
+                dataLog.includes("mod_web_qr_code_login") ||
+                explicitLoginPrompts.some((prompt) => text.includes(prompt)) ||
+                (text.includes("\u767b\u5f55") && text.includes("\u626b\u7801"))
+              );
+            };
+
+            return Array.from(
+              document.querySelectorAll(
+                [
+                  "[role='dialog']",
+                  ".mrc-modal-container",
+                  ".mrc-modal-appear-done",
+                  ".mrc-modal-enter-done",
+                  ".m-layer",
+                  "[data-log*='page_web_register_login']",
+                  "[data-log*='mod_web_qr_code_login']"
+                ].join(",")
+              )
+            ).some((element) => visible(element) && looksLikeExplicitLoginPrompt(element));
+          }, NETEASE_EXPLICIT_LOGIN_PROMPTS)
+          .catch(() => false)
+      )
+    );
+
+    return checks.some(Boolean);
   }
 
   private async pauseCurrentPagePlayback(
@@ -995,7 +1061,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
 
 async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<NeteaseLoginSurfaceSnapshot> {
   return await surface
-    .evaluate((): NeteaseLoginSurfaceSnapshot => {
+    .evaluate((explicitLoginPrompts: readonly string[]): NeteaseLoginSurfaceSnapshot => {
       const visible = (element: Element): boolean => {
         const style = window.getComputedStyle(element);
         const rect = element.getBoundingClientRect();
@@ -1020,6 +1086,13 @@ async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<Netea
       const looksLikeLoginModal = (element: Element): boolean => {
         const text = textFor(element);
         const dataLog = dataLogFor(element);
+        if (
+          explicitLoginPrompts.some((prompt) => text.includes(prompt)) ||
+          (text.includes("\u767b\u5f55") && text.includes("\u626b\u7801"))
+        ) {
+          return true;
+        }
+
         return (
           dataLog.includes("page_web_register_login") ||
           dataLog.includes("mod_web_qr_code_login") ||
@@ -1056,8 +1129,10 @@ async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<Netea
         document.querySelectorAll(
           [
             ".mrc-modal-container[role='dialog']",
+            ".mrc-modal-container",
             ".mrc-modal-appear-done .mrc-modal-container[role='dialog']",
             ".mrc-modal-enter-done .mrc-modal-container[role='dialog']",
+            "[role='dialog']",
             ".m-layer",
             "[data-log*='page_web_register_login']",
             "[data-log*='mod_web_qr_code_login']"
@@ -1076,7 +1151,9 @@ async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<Netea
             "[class*='login']",
             "[class*='Login']",
             "[class*='qr']",
-            "[class*='scan']"
+            "[class*='scan']",
+            "[data-log*='page_web_register_login']",
+            "[data-log*='mod_web_qr_code_login']"
           ].join(",")
         )
       ).filter(visible);
@@ -1088,7 +1165,7 @@ async function readNeteaseLoginSurfaceSnapshot(surface: PageLike): Promise<Netea
         loginModalTexts: loginModalElements.map(textFor),
         loginTexts: loginElements.map(textFor)
       };
-    })
+    }, NETEASE_EXPLICIT_LOGIN_PROMPTS)
     .catch((): NeteaseLoginSurfaceSnapshot => emptyNeteaseLoginSurfaceSnapshot());
 }
 
@@ -1116,6 +1193,15 @@ export function mergeNeteaseLoginSurfaceSnapshots(
     loginTexts: snapshots.flatMap((snapshot) => snapshot.loginTexts)
   };
 }
+
+function snapshotHasExplicitLoginPrompt(snapshot: NeteaseLoginSurfaceSnapshot): boolean {
+  return (
+    snapshot.loginModalCandidateCount > 0 ||
+    snapshot.loginModalTexts.some(neteaseTextLooksLikeExplicitLoginModal) ||
+    snapshot.loginTexts.some(neteaseTextLooksLikeExplicitLoginModal)
+  );
+}
+
 export function neteaseTextContainsTrackTitle(text: string, track: Pick<Track, "title">): boolean {
   const normalizedText = normalizeNeteaseText(text);
   const normalizedTitle = normalizeNeteaseText(track.title);
@@ -1132,10 +1218,7 @@ export function resolveNeteaseLoginSurface(snapshot: NeteaseLoginSurfaceSnapshot
     return { state: "logged_in", accountName };
   }
 
-  if (
-    snapshot.loginModalCandidateCount > 0 ||
-    snapshot.loginModalTexts.some(neteaseTextLooksLikeExplicitLoginModal)
-  ) {
+  if (snapshotHasExplicitLoginPrompt(snapshot)) {
     return { state: "login_required" };
   }
 
@@ -1143,10 +1226,7 @@ export function resolveNeteaseLoginSurface(snapshot: NeteaseLoginSurfaceSnapshot
 }
 
 export function neteaseSnapshotHasLoginDialog(snapshot: NeteaseLoginSurfaceSnapshot): boolean {
-  return (
-    snapshot.loginModalCandidateCount > 0 ||
-    snapshot.loginModalTexts.some(neteaseTextLooksLikeExplicitLoginModal)
-  );
+  return snapshotHasExplicitLoginPrompt(snapshot);
 }
 
 export function isNeteaseLoginRequiredError(error: unknown): boolean {
@@ -1200,6 +1280,13 @@ function neteaseTextLooksLikeLoginEntry(value: string): boolean {
 }
 
 function neteaseTextLooksLikeExplicitLoginModal(value: string): boolean {
+  if (
+    NETEASE_EXPLICIT_LOGIN_PROMPTS.some((prompt) => value.includes(prompt)) ||
+    (value.includes("\u767b\u5f55") && value.includes("\u626b\u7801"))
+  ) {
+    return true;
+  }
+
   return (
     value.includes("登录获取更懂你的好音乐") ||
     value.includes("扫码登录") ||

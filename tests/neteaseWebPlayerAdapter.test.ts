@@ -100,6 +100,21 @@ describe("resolveNeteaseLoginSurface", () => {
     ).toEqual({ state: "login_required" });
   });
 
+  it("detects the current NetEase Chinese QR login modal copy", () => {
+    const loginPrompt =
+      "\u767b\u5f55\u83b7\u53d6\u66f4\u61c2\u4f60\u7684\u597d\u97f3\u4e50 \u626b\u7801\u767b\u5f55";
+
+    expect(
+      resolveNeteaseLoginSurface({
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [loginPrompt],
+        loginTexts: []
+      })
+    ).toEqual({ state: "login_required" });
+  });
+
   it("merges login surface snapshots from page frames", () => {
     const snapshot = mergeNeteaseLoginSurfaceSnapshots([
       {
@@ -144,6 +159,18 @@ describe("neteaseSnapshotHasLoginDialog", () => {
       })
     ).toBe(true);
   });
+
+  it("detects explicit login prompts collected from broad login elements", () => {
+    expect(
+      neteaseSnapshotHasLoginDialog({
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 0,
+        loginModalTexts: [],
+        loginTexts: ["\u70b9\u51fb\u5237\u65b0 \u626b\u7801\u767b\u5f55"]
+      })
+    ).toBe(true);
+  });
 });
 
 describe("NeteaseWebPlayerAdapter pause control", () => {
@@ -178,6 +205,16 @@ describe("NeteaseWebPlayerAdapter clear control", () => {
 });
 
 describe("NeteaseWebPlayerAdapter login QR detection", () => {
+  it("detects a visible real NetEase login prompt during playback failure cleanup", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      explicitLoginPromptVisible: true
+    });
+    const adapter = adapterWithPage(page);
+
+    await expect((adapter as any).pageShowsExplicitLoginPrompt(page)).resolves.toBe(true);
+  });
+
   it("reuses the persistent NetEase login cookie after a restart", async () => {
     const page = new FakePage({
       domToggleSucceeds: false,
@@ -485,6 +522,7 @@ class FakePage {
       mediaPauseSucceeds?: boolean;
       qrScreenshot?: Buffer;
       dialogScreenshot?: Buffer;
+      explicitLoginPromptVisible?: boolean;
       loginEntryClicksBeforeSuccess?: number;
       routeInPlaceSucceeds?: boolean;
       surfaceSnapshot?: {
@@ -582,6 +620,10 @@ class FakePage {
         loginModalTexts: [],
         loginTexts: []
       };
+    }
+
+    if (source.includes("looksLikeExplicitLoginPrompt")) {
+      return Boolean(this.options.explicitLoginPromptVisible);
     }
 
     if (source.includes("#g_player")) {
