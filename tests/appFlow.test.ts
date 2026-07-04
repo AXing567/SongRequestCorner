@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { handleIncomingMessage } from "../src/app.js";
+import type { BotCard } from "../src/cards/BotCard.js";
 import { CommandService } from "../src/commands/CommandService.js";
 import type { AppConfig } from "../src/config.js";
 import type { IncomingMessage } from "../src/domain/types.js";
@@ -48,6 +49,20 @@ class FakeTransport implements BotTransport {
 
   async replyText(messageId: string, text: string): Promise<void> {
     this.replies.push({ messageId, text });
+  }
+}
+
+class FakeCardTransport extends FakeTransport {
+  readonly replyCards: Array<{ messageId: string; title: string }> = [];
+  readonly updates: Array<{ messageId: string; title: string }> = [];
+
+  async replyCard(messageId: string, card: BotCard): Promise<{ messageId: string }> {
+    this.replyCards.push({ messageId, title: card.header.title.content });
+    return { messageId: "om_card" };
+  }
+
+  async updateCard(messageId: string, card: BotCard): Promise<void> {
+    this.updates.push({ messageId, title: card.header.title.content });
   }
 }
 
@@ -102,6 +117,21 @@ describe("app message flow", () => {
       messageId: incoming.id,
       text: "收到，正在搜索「小星星」"
     });
+  });
+
+  it("updates the searching card with the final song request result when cards are available", async () => {
+    const queue = new QueueService();
+    const playback = new PlaybackEngine(queue, new MockPlayerAdapter());
+    const service = new CommandService(new MockMusicProvider(), queue, playback);
+    const transport = new FakeCardTransport();
+    const config = createHarness().config;
+    const incoming = { ...message("@点歌机器人 小星星"), canReply: true };
+
+    await handleIncomingMessage(incoming, config, service, transport);
+
+    expect(transport.replyCards).toEqual([{ messageId: incoming.id, title: "正在搜索" }]);
+    expect(transport.updates).toEqual([{ messageId: "om_card", title: "已加入队列" }]);
+    expect(transport.replies).toEqual([]);
   });
 
   it("handles queue view end to end", async () => {

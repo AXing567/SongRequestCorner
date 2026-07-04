@@ -1,6 +1,8 @@
 import type { Command } from "../domain/types.js";
 
-const INFO_COMMAND_ALIASES = new Map<string, Command["type"]>([
+type SimpleCommandType = Exclude<Command["type"], "request_song" | "unknown" | "replay_history">;
+
+const INFO_COMMAND_ALIASES = new Map<string, SimpleCommandType>([
   ["队列", "show_queue"],
   ["待播放", "show_queue"],
   ["当前播放", "current"],
@@ -33,8 +35,13 @@ export function parseCommand(rawText: string, botDisplayName = "点歌机器人"
     return { type: "request_song", query };
   }
 
+  const replayHistory = /^(?:再次加入|重新点播|重播)\s+(\S+)$/u.exec(text);
+  if (replayHistory) {
+    return { type: "replay_history", historyItemId: replayHistory[1]! };
+  }
+
   const exact = INFO_COMMAND_ALIASES.get(text);
-  if (exact && exact !== "request_song" && exact !== "unknown") {
+  if (exact) {
     return { type: exact };
   }
 

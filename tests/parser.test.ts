@@ -43,4 +43,15 @@ describe("parseCommand", () => {
     expect(parseCommand("帮助")).toEqual({ type: "help" });
     expect(parseCommand("清空队列")).toEqual({ type: "request_song", query: "清空队列" });
   });
+
+  it("parses history replay commands from card buttons", () => {
+    expect(parseCommand("再次加入 hist-1")).toEqual({
+      type: "replay_history",
+      historyItemId: "hist-1"
+    });
+    expect(parseCommand("重播 hist-2")).toEqual({
+      type: "replay_history",
+      historyItemId: "hist-2"
+    });
+  });
 });

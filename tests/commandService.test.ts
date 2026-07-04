@@ -188,6 +188,23 @@ describe("CommandService", () => {
     expect(result.text).toContain("A - 第一首");
   });
 
+  it("replays a history item from a card button command", async () => {
+    const { service, queue } = createServiceWithPlayer();
+    await service.execute({ type: "request_song", query: "第一首 A" }, message("u1"));
+    await service.execute({ type: "request_song", query: "第二首 B" }, message("u2"));
+    await service.execute({ type: "skip" }, message("u3"));
+
+    const historyItem = queue.listHistoryPage({ page: 1, pageSize: 10 }).items[0]!;
+    const result = await service.execute(
+      { type: "replay_history", historyItemId: historyItem.id },
+      message("u4")
+    );
+
+    expect(result.text).toContain("已再次加入队列");
+    expect(queue.listPending()[0]?.track.title).toBe("第一首");
+    expect(queue.listPending()[0]?.requester.id).toBe("u4");
+  });
+
   it("returns chat help with playback controls", async () => {
     const { service } = createService();
 

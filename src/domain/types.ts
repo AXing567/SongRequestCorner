@@ -68,5 +68,6 @@ export type Command =
   | { type: "pause" }
   | { type: "resume" }
   | { type: "history" }
+  | { type: "replay_history"; historyItemId: string }
   | { type: "help" }
   | { type: "unknown"; reason: string };

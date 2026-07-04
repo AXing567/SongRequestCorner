@@ -9,6 +9,7 @@ It lets people mention a Feishu bot in a group chat, request a song, and have th
 ## Features
 
 - Feishu group chat song requests.
+- Feishu interactive cards for song request results, queue views, and playback controls.
 - Immediate bot feedback for searching, queued songs, and failures.
 - NetEase web search and playback using your own logged-in account.
 - Local admin page for current playback, queue reorder/remove, skip, pause/resume, and play-history replay.
@@ -73,9 +74,9 @@ In the Feishu developer console:
 1. Create an internal app.
 2. Enable bot capability.
 3. Add the bot to your target group.
-4. Subscribe to `im.message.receive_v1`.
+4. Subscribe to `im.message.receive_v1` and `card.action.trigger`.
 5. Use long connection event subscription.
-6. Grant message send plus image upload/send permissions so the bot can post NetEase login QR codes when needed.
+6. Grant message send, interactive card, image upload/send, and basic user info permissions so the bot can post cards, receive button clicks, show requester names, and post NetEase login QR codes when needed.
 7. Copy the app id and app secret into `.env`.
 
 Then set:
@@ -97,13 +98,20 @@ Feishu users can request songs with either format:
 Supported chat commands:
 
 ```text
+点歌 晴天 周杰伦
+晴天 周杰伦
 队列
+待播放
 当前播放
 撤销我的点歌
+切歌
+暂停
+继续
+历史记录
 帮助
 ```
 
-Playback management is intentionally handled by the local admin page instead of Feishu admin commands.
+Feishu cards include buttons for common queue and playback actions. The local admin page is still available for detailed queue management.
 
 ## NetEase Playback
 

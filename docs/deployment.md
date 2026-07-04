@@ -58,8 +58,9 @@ In the Feishu developer console:
 1. Create an internal app.
 2. Enable bot capability.
 3. Add the bot to your group.
-4. Subscribe to `im.message.receive_v1`.
+4. Subscribe to `im.message.receive_v1` and `card.action.trigger`.
 5. Enable long connection events.
+6. Grant message send, interactive card, image upload/send, and basic user info permissions.
 
 Set:
 
@@ -157,6 +158,12 @@ For always-on usage, configure a Windows service or scheduled task. See [windows
 - Confirm long connection is enabled.
 - Run `npm run doctor`.
 - Check that `FEISHU_APP_ID` and `FEISHU_APP_SECRET` match the app.
+
+### Feishu card buttons do not work
+
+- Confirm `card.action.trigger` is subscribed.
+- Confirm card-related permissions are enabled and the app has been republished or reinstalled after permission changes.
+- Check the terminal for `[feishu] received card.action.trigger event`.
 
 ### NetEase browser opens but does not play
 

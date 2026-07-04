@@ -1,9 +1,16 @@
 import type { Server } from "node:http";
+import type { BotCard } from "./cards/BotCard.js";
+import {
+  createErrorCard,
+  createPlaybackStartedCard,
+  createQueueDepletedCard,
+  createSearchingCard
+} from "./cards/BotCard.js";
 import type { AppConfig } from "./config.js";
 import { CommandService } from "./commands/CommandService.js";
 import { parseCommand } from "./commands/parser.js";
 import type { IncomingMessage } from "./domain/types.js";
-import type { BotTransport } from "./integrations/BotTransport.js";
+import type { BotTransport, SentBotMessage } from "./integrations/BotTransport.js";
 import { ConsoleTransport } from "./integrations/ConsoleTransport.js";
 import { FeishuTransport } from "./integrations/FeishuTransport.js";
 import { SqliteHistoryStore } from "./history/HistoryStore.js";
@@ -36,7 +43,8 @@ export async function startApp(config: AppConfig): Promise<void> {
         return;
       }
 
-      await safeSend(transport, lastChatId, `当前播放：${formatTrack(item.track)}`);
+      const text = `当前播放：${formatTrack(item.track)}`;
+      await safeSend(transport, lastChatId, text, createPlaybackStartedCard(text));
     },
     onQueueDepleted: async () => {
       if (!transport || !lastChatId) {
@@ -46,7 +54,10 @@ export async function startApp(config: AppConfig): Promise<void> {
       await safeSend(
         transport,
         lastChatId,
-        "点歌队列已经没有歌曲了，接下来会由网易云自动播放下一首。想听指定歌曲的话，继续 @我 发送歌名就行。"
+        "点歌队列已经没有歌曲了，接下来会由网易云自动播放下一首。想听指定歌曲的话，继续 @我 发送歌名就行。",
+        createQueueDepletedCard(
+          "点歌队列已经没有歌曲了，接下来会由网易云自动播放下一首。想听指定歌曲的话，继续 @我 发送歌名就行。"
+        )
       );
     }
   });
@@ -176,18 +187,31 @@ export async function handleIncomingMessage(
   const command = parseCommand(message.text, config.botDisplayName);
   onSeenChat?.(message.chatId);
 
+  let progressMessage: SentBotMessage | undefined;
   if (command.type === "request_song") {
-    await safeReplyOrSend(transport, message, `收到，正在搜索「${command.query}」`);
+    progressMessage = await safeReplyOrSend(
+      transport,
+      message,
+      `收到，正在搜索「${command.query}」`,
+      createSearchingCard(command.query)
+    );
   }
 
   try {
     const result = await commandService.execute(command, message);
-    await safeReplyOrSend(transport, message, result.text);
+    const updated = await safeUpdateCard(transport, progressMessage?.messageId, result.card);
+    if (!updated) {
+      await safeReplyOrSend(transport, message, result.text, result.card);
+    }
     if (result.shouldCheckLogin) {
       await checkLoginStatusForNotification(loginNotifier);
     }
   } catch (error) {
-    await safeReplyOrSend(transport, message, humanizeError(error));
+    const text = humanizeError(error);
+    const updated = await safeUpdateCard(transport, progressMessage?.messageId, createErrorCard(text));
+    if (!updated) {
+      await safeReplyOrSend(transport, message, text, createErrorCard(text));
+    }
     if (isNeteaseLoginRequiredError(error)) {
       await checkLoginStatusForNotification(loginNotifier);
     }
@@ -216,29 +240,69 @@ function createTransport(config: AppConfig): BotTransport {
   return new ConsoleTransport(config);
 }
 
-async function safeSend(transport: BotTransport, chatId: string, text: string): Promise<void> {
+async function safeSend(
+  transport: BotTransport,
+  chatId: string,
+  text: string,
+  card?: BotCard
+): Promise<SentBotMessage | undefined> {
+  if (card && transport.sendCard) {
+    try {
+      return (await transport.sendCard(chatId, card)) ?? undefined;
+    } catch (error) {
+      console.error(`Card send failed: ${String(error)}`);
+    }
+  }
+
   try {
-    await transport.sendText(chatId, text);
+    return (await transport.sendText(chatId, text)) ?? undefined;
   } catch (error) {
     console.error(`Message send failed: ${String(error)}`);
+    return undefined;
   }
 }
 
 async function safeReplyOrSend(
   transport: BotTransport,
   message: IncomingMessage,
-  text: string
-): Promise<void> {
+  text: string,
+  card?: BotCard
+): Promise<SentBotMessage | undefined> {
+  if (card && message.canReply && transport.replyCard) {
+    try {
+      return (await transport.replyCard(message.id, card)) ?? undefined;
+    } catch (error) {
+      console.error(`Card reply failed: ${String(error)}`);
+    }
+  }
+
   if (message.canReply && transport.replyText) {
     try {
-      await transport.replyText(message.id, text);
-      return;
+      return (await transport.replyText(message.id, text)) ?? undefined;
     } catch (error) {
       console.error(`Message reply failed: ${String(error)}`);
     }
   }
 
-  await safeSend(transport, message.chatId, text);
+  return await safeSend(transport, message.chatId, text, card);
+}
+
+async function safeUpdateCard(
+  transport: BotTransport,
+  messageId: string | undefined,
+  card: BotCard | undefined
+): Promise<boolean> {
+  if (!messageId || !card || !transport.updateCard) {
+    return false;
+  }
+
+  try {
+    await transport.updateCard(messageId, card);
+    return true;
+  } catch (error) {
+    console.error(`Card update failed: ${String(error)}`);
+    return false;
+  }
 }
 
 function humanizeError(error: unknown): string {

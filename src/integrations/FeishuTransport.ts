@@ -1,8 +1,13 @@
 import { randomUUID } from "node:crypto";
+import {
+  cardActionCommandToText,
+  isBotCardActionCommand,
+  type BotCard
+} from "../cards/BotCard.js";
 import type { AppConfig } from "../config.js";
 import type { IncomingMessage } from "../domain/types.js";
 import type { PlayerLoginQrCode } from "../players/PlayerAdapter.js";
-import type { BotTransport } from "./BotTransport.js";
+import type { BotTransport, SentBotMessage } from "./BotTransport.js";
 
 interface TenantAccessTokenResponse {
   code: number;
@@ -21,11 +26,20 @@ interface FeishuImageUploadData {
   image_key?: string;
 }
 
+interface FeishuMessageData {
+  message_id?: string;
+  message?: {
+    message_id?: string;
+  };
+}
+
 interface FeishuUserProfileData {
   user?: unknown;
 }
 
 type FeishuUserIdType = "open_id" | "user_id" | "union_id";
+type FeishuMessageType = "text" | "image" | "interactive";
+type FeishuMessageContent = Record<string, string> | BotCard;
 
 interface FeishuMessageEvent {
   event?: FeishuMessageEventBody;
@@ -51,6 +65,42 @@ interface FeishuMessageEventBody {
       union_id?: string;
     };
   };
+}
+
+interface FeishuCardActionEvent {
+  event?: FeishuCardActionEventBody;
+  action?: FeishuCardActionEventBody["action"];
+  operator?: FeishuCardActionEventBody["operator"];
+  context?: FeishuCardActionEventBody["context"];
+  token?: string;
+  header?: {
+    event_id?: string;
+    event_type?: string;
+    create_time?: string | number;
+  };
+}
+
+interface FeishuCardActionEventBody {
+  action?: {
+    value?: unknown;
+  };
+  operator?: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+    operator_id?: {
+      open_id?: string;
+      user_id?: string;
+      union_id?: string;
+    };
+  };
+  context?: {
+    open_chat_id?: string;
+    chat_id?: string;
+    open_message_id?: string;
+    message_id?: string;
+  };
+  token?: string;
 }
 
 const FEISHU_CONNECT_WAIT_MS = 30_000;
@@ -101,6 +151,9 @@ export class FeishuTransport implements BotTransport {
     this.dispatcher = new lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (event: FeishuMessageEvent) => {
         await this.handleMessageEvent(event, onMessage);
+      },
+      "card.action.trigger": async (event: FeishuCardActionEvent) => {
+        await this.handleCardActionEvent(event, onMessage);
       }
     });
     this.wrapDispatcherForDiagnostics();
@@ -210,6 +263,39 @@ export class FeishuTransport implements BotTransport {
     }
   }
 
+  private async handleCardActionEvent(
+    event: FeishuCardActionEvent,
+    onMessage: (message: IncomingMessage) => Promise<void>
+  ): Promise<void> {
+    console.log("[feishu] received card.action.trigger event");
+
+    try {
+      const normalized = normalizeFeishuCardActionEvent(event, this.config.adminUserIds);
+      if (normalized) {
+        const enriched = await this.enrichCardActionSenderName(event, normalized);
+        console.log(
+          `[feishu] card action from ${enriched.sender.name ?? enriched.sender.id} (${enriched.sender.id}): ${
+            enriched.text
+          }`
+        );
+        await onMessage(enriched);
+        return;
+      }
+
+      const data = event.event ?? event;
+      console.warn(
+        `[feishu] ignored card action because required fields were missing: ${JSON.stringify({
+          eventType: event.header?.event_type,
+          hasAction: Boolean(data?.action),
+          hasOperator: Boolean(data?.operator),
+          hasContext: Boolean(data?.context)
+        })}`
+      );
+    } catch (error) {
+      console.error(`[feishu] card action handler failed: ${errorMessage(error)}`);
+    }
+  }
+
   private async enrichSenderName(event: FeishuMessageEvent, message: IncomingMessage): Promise<IncomingMessage> {
     const identity = readFeishuSenderIdentity(event.event ?? event);
     if (!identity) {
@@ -230,8 +316,31 @@ export class FeishuTransport implements BotTransport {
     };
   }
 
-  async sendText(chatId: string, text: string): Promise<void> {
-    await this.sendMessage(chatId, "text", { text });
+  private async enrichCardActionSenderName(
+    event: FeishuCardActionEvent,
+    message: IncomingMessage
+  ): Promise<IncomingMessage> {
+    const identity = readFeishuOperatorIdentity(event.event ?? event);
+    if (!identity) {
+      return message;
+    }
+
+    const name = await this.lookupUserDisplayName(identity.id, identity.type);
+    if (!name) {
+      return message;
+    }
+
+    return {
+      ...message,
+      sender: {
+        ...message.sender,
+        name
+      }
+    };
+  }
+
+  async sendText(chatId: string, text: string): Promise<SentBotMessage | void> {
+    return await this.sendMessage(chatId, "text", { text });
   }
 
   async sendImage(chatId: string, image: PlayerLoginQrCode): Promise<void> {
@@ -239,7 +348,42 @@ export class FeishuTransport implements BotTransport {
     await this.sendMessage(chatId, "image", { image_key: imageKey });
   }
 
-  async replyText(messageId: string, text: string): Promise<void> {
+  async sendCard(chatId: string, card: BotCard): Promise<SentBotMessage | void> {
+    return await this.sendMessage(chatId, "interactive", card);
+  }
+
+  async replyText(messageId: string, text: string): Promise<SentBotMessage | void> {
+    return await this.replyMessage(messageId, "text", { text });
+  }
+
+  async replyCard(messageId: string, card: BotCard): Promise<SentBotMessage | void> {
+    return await this.replyMessage(messageId, "interactive", card);
+  }
+
+  async updateCard(messageId: string, card: BotCard): Promise<void> {
+    const token = await this.getTenantAccessToken();
+    const response = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+      {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json; charset=utf-8"
+        },
+        body: JSON.stringify({
+          content: JSON.stringify(card)
+        })
+      }
+    );
+
+    await assertFeishuOk(response, "Feishu update card failed");
+  }
+
+  private async replyMessage(
+    messageId: string,
+    msgType: FeishuMessageType,
+    content: FeishuMessageContent
+  ): Promise<SentBotMessage | void> {
     const token = await this.getTenantAccessToken();
     const response = await fetch(
       `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`,
@@ -250,16 +394,21 @@ export class FeishuTransport implements BotTransport {
           "content-type": "application/json; charset=utf-8"
         },
         body: JSON.stringify({
-          msg_type: "text",
-          content: JSON.stringify({ text })
+          msg_type: msgType,
+          content: JSON.stringify(content)
         })
       }
     );
 
-    await assertFeishuOk(response, "Feishu reply message failed");
+    const body = await readFeishuJson<FeishuMessageData>(response, "Feishu reply message failed");
+    return { messageId: readFeishuMessageId(body.data) };
   }
 
-  private async sendMessage(chatId: string, msgType: "text" | "image", content: Record<string, string>): Promise<void> {
+  private async sendMessage(
+    chatId: string,
+    msgType: FeishuMessageType,
+    content: FeishuMessageContent
+  ): Promise<SentBotMessage | void> {
     const token = await this.getTenantAccessToken();
     const response = await fetch(
       "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
@@ -277,7 +426,8 @@ export class FeishuTransport implements BotTransport {
       }
     );
 
-    await assertFeishuOk(response, "Feishu send message failed");
+    const body = await readFeishuJson<FeishuMessageData>(response, "Feishu send message failed");
+    return { messageId: readFeishuMessageId(body.data) };
   }
 
   private async uploadImage(image: PlayerLoginQrCode): Promise<string> {
@@ -442,6 +592,10 @@ async function readFeishuJson<T>(response: Response, action: string): Promise<Fe
   return body;
 }
 
+function readFeishuMessageId(data: FeishuMessageData | undefined): string | undefined {
+  return firstPlainString(data?.message_id, data?.message?.message_id);
+}
+
 export function normalizeFeishuMessageEvent(
   event: FeishuMessageEvent,
   adminUserIds: Set<string>
@@ -474,6 +628,41 @@ export function normalizeFeishuMessageEvent(
     },
     createdAt: new Date(Number(message?.create_time ?? Date.now())),
     canReply: true
+  };
+}
+
+export function normalizeFeishuCardActionEvent(
+  event: FeishuCardActionEvent,
+  adminUserIds: Set<string>
+): IncomingMessage | undefined {
+  const data = event.event ?? event;
+  if (!data) {
+    return undefined;
+  }
+
+  const text = readCardActionText(data.action?.value);
+  const chatId = firstPlainString(data.context?.open_chat_id, data.context?.chat_id);
+  const senderIdentity = readFeishuOperatorIdentity(data);
+  if (!text || !chatId || !senderIdentity) {
+    return undefined;
+  }
+
+  return {
+    id:
+      firstPlainString(
+        data.token,
+        event.header?.event_id,
+        data.context?.open_message_id,
+        data.context?.message_id
+      ) ?? randomUUID(),
+    chatId,
+    text,
+    sender: {
+      id: senderIdentity.id,
+      role: adminUserIds.has(senderIdentity.id) ? "admin" : "employee"
+    },
+    createdAt: new Date(Number(event.header?.create_time ?? Date.now())),
+    canReply: false
   };
 }
 
@@ -515,6 +704,48 @@ function readFeishuSenderIdentity(
   const unionId = firstPlainString(senderId?.union_id);
   if (unionId) {
     return { id: unionId, type: "union_id" };
+  }
+
+  return undefined;
+}
+
+function readFeishuOperatorIdentity(
+  body: FeishuCardActionEventBody | undefined
+): { id: string; type: FeishuUserIdType } | undefined {
+  const operator = body?.operator;
+  const operatorId = operator?.operator_id;
+  const openId = firstPlainString(operator?.open_id, operatorId?.open_id);
+  if (openId) {
+    return { id: openId, type: "open_id" };
+  }
+
+  const userId = firstPlainString(operator?.user_id, operatorId?.user_id);
+  if (userId) {
+    return { id: userId, type: "user_id" };
+  }
+
+  const unionId = firstPlainString(operator?.union_id, operatorId?.union_id);
+  if (unionId) {
+    return { id: unionId, type: "union_id" };
+  }
+
+  return undefined;
+}
+
+function readCardActionText(value: unknown): string | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+
+  const explicitText = firstPlainString(record.text);
+  if (explicitText) {
+    return explicitText;
+  }
+
+  const command = firstPlainString(record.command);
+  if (command && isBotCardActionCommand(command)) {
+    return cardActionCommandToText(command);
   }
 
   return undefined;
