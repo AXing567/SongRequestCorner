@@ -67,5 +67,6 @@ export type Command =
   | { type: "clear_queue" }
   | { type: "pause" }
   | { type: "resume" }
+  | { type: "history" }
   | { type: "help" }
   | { type: "unknown"; reason: string };

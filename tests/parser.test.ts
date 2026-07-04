@@ -29,10 +29,18 @@ describe("parseCommand", () => {
     expect(parseCommand("撤销我的点歌")).toEqual({ type: "cancel_mine" });
   });
 
-  it("treats management words as song requests in chat", () => {
-    expect(parseCommand("切歌")).toEqual({ type: "request_song", query: "切歌" });
+  it("parses playback control commands available to every Feishu user", () => {
+    expect(parseCommand("切歌")).toEqual({ type: "skip" });
+    expect(parseCommand("下一首")).toEqual({ type: "skip" });
+    expect(parseCommand("暂停")).toEqual({ type: "pause" });
+    expect(parseCommand("继续")).toEqual({ type: "resume" });
+  });
+
+  it("parses queue, history, and help aliases", () => {
+    expect(parseCommand("待播放")).toEqual({ type: "show_queue" });
+    expect(parseCommand("历史记录")).toEqual({ type: "history" });
+    expect(parseCommand("历史")).toEqual({ type: "history" });
+    expect(parseCommand("帮助")).toEqual({ type: "help" });
     expect(parseCommand("清空队列")).toEqual({ type: "request_song", query: "清空队列" });
-    expect(parseCommand("暂停")).toEqual({ type: "request_song", query: "暂停" });
-    expect(parseCommand("继续")).toEqual({ type: "request_song", query: "继续" });
   });
 });

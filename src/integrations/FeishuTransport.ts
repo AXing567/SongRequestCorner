@@ -21,6 +21,12 @@ interface FeishuImageUploadData {
   image_key?: string;
 }
 
+interface FeishuUserProfileData {
+  user?: unknown;
+}
+
+type FeishuUserIdType = "open_id" | "user_id" | "union_id";
+
 interface FeishuMessageEvent {
   event?: FeishuMessageEventBody;
   message?: FeishuMessageEventBody["message"];
@@ -49,9 +55,13 @@ interface FeishuMessageEventBody {
 
 const FEISHU_CONNECT_WAIT_MS = 30_000;
 const FEISHU_STATUS_LOG_INTERVAL_MS = 10_000;
+const FEISHU_USER_NAME_CACHE_MS = 24 * 60 * 60 * 1000;
+const FEISHU_USER_NAME_FAILURE_CACHE_MS = 10 * 60 * 1000;
 
 export class FeishuTransport implements BotTransport {
   private tenantToken?: { value: string; expiresAt: number };
+  private readonly userNameCache = new Map<string, { name?: string; expiresAt: number }>();
+  private readonly userNameInflight = new Map<string, Promise<string | undefined>>();
   private sdk: any;
   private wsClient?: any;
   private dispatcher?: any;
@@ -174,8 +184,13 @@ export class FeishuTransport implements BotTransport {
     try {
       const normalized = normalizeFeishuMessageEvent(event, this.config.adminUserIds);
       if (normalized) {
-        console.log(`[feishu] message from ${normalized.sender.id}: ${normalized.text}`);
-        await onMessage(normalized);
+        const enriched = await this.enrichSenderName(event, normalized);
+        console.log(
+          `[feishu] message from ${enriched.sender.name ?? enriched.sender.id} (${enriched.sender.id}): ${
+            enriched.text
+          }`
+        );
+        await onMessage(enriched);
         return;
       }
 
@@ -193,6 +208,26 @@ export class FeishuTransport implements BotTransport {
     } catch (error) {
       console.error(`[feishu] message event handler failed: ${errorMessage(error)}`);
     }
+  }
+
+  private async enrichSenderName(event: FeishuMessageEvent, message: IncomingMessage): Promise<IncomingMessage> {
+    const identity = readFeishuSenderIdentity(event.event ?? event);
+    if (!identity) {
+      return message;
+    }
+
+    const name = await this.lookupUserDisplayName(identity.id, identity.type);
+    if (!name) {
+      return message;
+    }
+
+    return {
+      ...message,
+      sender: {
+        ...message.sender,
+        name
+      }
+    };
   }
 
   async sendText(chatId: string, text: string): Promise<void> {
@@ -271,6 +306,68 @@ export class FeishuTransport implements BotTransport {
     }
 
     return imageKey;
+  }
+
+  private async lookupUserDisplayName(
+    userId: string,
+    userIdType: FeishuUserIdType
+  ): Promise<string | undefined> {
+    const cacheKey = `${userIdType}:${userId}`;
+    const now = Date.now();
+    const cached = this.userNameCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.name;
+    }
+
+    const inflight = this.userNameInflight.get(cacheKey);
+    if (inflight) {
+      return inflight;
+    }
+
+    const request = this.fetchUserDisplayName(userId, userIdType)
+      .then((name) => {
+        this.userNameCache.set(cacheKey, {
+          name,
+          expiresAt: Date.now() + (name ? FEISHU_USER_NAME_CACHE_MS : FEISHU_USER_NAME_FAILURE_CACHE_MS)
+        });
+        return name;
+      })
+      .catch((error) => {
+        console.warn(
+          `[feishu] could not resolve user display name for ${userIdType}:${userId}: ${errorMessage(error)}`
+        );
+        this.userNameCache.set(cacheKey, {
+          expiresAt: Date.now() + FEISHU_USER_NAME_FAILURE_CACHE_MS
+        });
+        return undefined;
+      })
+      .finally(() => {
+        this.userNameInflight.delete(cacheKey);
+      });
+
+    this.userNameInflight.set(cacheKey, request);
+    return request;
+  }
+
+  private async fetchUserDisplayName(
+    userId: string,
+    userIdType: FeishuUserIdType
+  ): Promise<string | undefined> {
+    const token = await this.getTenantAccessToken();
+    const response = await fetch(
+      `https://open.feishu.cn/open-apis/contact/v3/users/${encodeURIComponent(
+        userId
+      )}?user_id_type=${encodeURIComponent(userIdType)}`,
+      {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${token}`
+        }
+      }
+    );
+
+    const body = await readFeishuJson<FeishuUserProfileData>(response, "Feishu get user profile failed");
+    return pickFeishuUserDisplayName(body.data?.user);
   }
 
   private async getTenantAccessToken(): Promise<string> {
@@ -354,10 +451,10 @@ export function normalizeFeishuMessageEvent(
     return undefined;
   }
   const message = data.message;
-  const sender = data.sender;
+  const senderIdentity = readFeishuSenderIdentity(data);
 
   const chatId = message?.chat_id;
-  const senderId = sender?.sender_id?.open_id ?? sender?.sender_id?.user_id;
+  const senderId = senderIdentity?.id;
   if (!chatId || !senderId) {
     return undefined;
   }
@@ -373,12 +470,54 @@ export function normalizeFeishuMessageEvent(
     text,
     sender: {
       id: senderId,
-      name: sender?.sender_id?.union_id ?? senderId,
       role: adminUserIds.has(senderId) ? "admin" : "employee"
     },
     createdAt: new Date(Number(message?.create_time ?? Date.now())),
     canReply: true
   };
+}
+
+export function pickFeishuUserDisplayName(user: unknown): string | undefined {
+  const record = asRecord(user);
+  if (!record) {
+    return undefined;
+  }
+
+  const i18nName = asRecord(record.i18n_name);
+  return firstPlainString(
+    record.name,
+    i18nName?.zh_cn,
+    i18nName?.zh_hk,
+    i18nName?.zh_tw,
+    record.display_name,
+    record.nickname,
+    record.en_name,
+    i18nName?.en_us,
+    i18nName?.ja_jp,
+    record.alias
+  );
+}
+
+function readFeishuSenderIdentity(
+  body: FeishuMessageEventBody | undefined
+): { id: string; type: FeishuUserIdType } | undefined {
+  const senderId = body?.sender?.sender_id;
+  const openId = firstPlainString(senderId?.open_id);
+  if (openId) {
+    return { id: openId, type: "open_id" };
+  }
+
+  const userId = firstPlainString(senderId?.user_id);
+  if (userId) {
+    return { id: userId, type: "user_id" };
+  }
+
+  const unionId = firstPlainString(senderId?.union_id);
+  if (unionId) {
+    return { id: unionId, type: "union_id" };
+  }
+
+  return undefined;
 }
 
 function extractFeishuText(content: unknown): string | undefined {

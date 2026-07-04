@@ -1,15 +1,68 @@
 import { describe, expect, it } from "vitest";
 import { CommandService } from "../src/commands/CommandService.js";
-import type { IncomingMessage } from "../src/domain/types.js";
+import type { IncomingMessage, PlayerStatus, QueueItem } from "../src/domain/types.js";
 import { PlaybackEngine } from "../src/playback/PlaybackEngine.js";
 import { MockPlayerAdapter } from "../src/players/MockPlayerAdapter.js";
+import type { PlayerAdapter } from "../src/players/PlayerAdapter.js";
 import { MockMusicProvider } from "../src/providers/MockMusicProvider.js";
 import { QueueService } from "../src/queue/QueueService.js";
+
+class RecordingPlayer implements PlayerAdapter {
+  calls: string[] = [];
+  status: PlayerStatus = { state: "idle" };
+  clearDelayMs = 0;
+
+  async getStatus(): Promise<PlayerStatus> {
+    return this.status;
+  }
+
+  async play(item: QueueItem): Promise<void> {
+    this.calls.push(`play:${item.track.title}`);
+    this.status = { state: "playing", current: item };
+  }
+
+  async skip(): Promise<void> {
+    this.calls.push("skip");
+    this.status = { state: "idle" };
+  }
+
+  async pause(): Promise<void> {
+    this.calls.push("pause");
+    if (this.status.current) {
+      this.status = { ...this.status, state: "paused" };
+    }
+  }
+
+  async resume(): Promise<void> {
+    this.calls.push("resume");
+    if (this.status.current) {
+      this.status = { ...this.status, state: "playing" };
+    }
+  }
+
+  async clear(): Promise<void> {
+    this.calls.push("clear");
+    if (this.clearDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.clearDelayMs));
+    }
+    this.status = { state: "idle" };
+  }
+}
 
 function createService() {
   const queue = new QueueService();
   const playback = new PlaybackEngine(queue, new MockPlayerAdapter());
   return {
+    queue,
+    service: new CommandService(new MockMusicProvider(), queue, playback)
+  };
+}
+
+function createServiceWithPlayer(player = new RecordingPlayer()) {
+  const queue = new QueueService();
+  const playback = new PlaybackEngine(queue, player);
+  return {
+    player,
     queue,
     service: new CommandService(new MockMusicProvider(), queue, playback)
   };
@@ -54,12 +107,48 @@ describe("CommandService", () => {
     expect(result.text).toContain("B - 第二首");
   });
 
-  it("does not execute management commands from chat", async () => {
-    const { service } = createService();
+  it("lets any user skip from chat controls", async () => {
+    const { service, queue, player } = createServiceWithPlayer();
+    await service.execute({ type: "request_song", query: "第一首 A" }, message("u1"));
+    await service.execute({ type: "request_song", query: "第二首 B" }, message("u2"));
 
-    const result = await service.execute({ type: "skip" }, message("u1"));
+    const result = await service.execute({ type: "skip" }, message("u3"));
 
-    expect(result.text).toBe("请在本地管理面板里切歌。");
+    expect(result.text).toContain("已切歌");
+    expect(queue.getCurrent()?.track.title).toBe("第二首");
+    expect(player.calls).toEqual(["play:第一首", "clear", "play:第二首"]);
+  });
+
+  it("deduplicates concurrent skip commands for the same playback state", async () => {
+    const player = new RecordingPlayer();
+    player.clearDelayMs = 20;
+    const { service, queue } = createServiceWithPlayer(player);
+    await service.execute({ type: "request_song", query: "第一首 A" }, message("u1"));
+    await service.execute({ type: "request_song", query: "第二首 B" }, message("u2"));
+    await service.execute({ type: "request_song", query: "第三首 C" }, message("u3"));
+
+    const [first, second] = await Promise.all([
+      service.execute({ type: "skip" }, message("u4")),
+      service.execute({ type: "skip" }, message("u5"))
+    ]);
+
+    expect([first.text, second.text].some((text) => text.includes("已切歌"))).toBe(true);
+    expect([first.text, second.text].some((text) => text.includes("刚刚已经有人切过"))).toBe(true);
+    expect(queue.getCurrent()?.track.title).toBe("第二首");
+    expect(queue.listPending().map((item) => item.track.title)).toEqual(["第三首"]);
+    expect(player.calls).toEqual(["play:第一首", "clear", "play:第二首"]);
+  });
+
+  it("lets any user pause and resume from chat controls", async () => {
+    const { service, player } = createServiceWithPlayer();
+    await service.execute({ type: "request_song", query: "晴天 周杰伦" }, message("u1"));
+
+    const pause = await service.execute({ type: "pause" }, message("u2"));
+    const resume = await service.execute({ type: "resume" }, message("u3"));
+
+    expect(pause.text).toBe("已暂停当前播放。");
+    expect(resume.text).toBe("已继续播放。");
+    expect(player.calls).toEqual(["play:晴天", "pause", "resume"]);
   });
 
   it("does not expose clear queue through chat", async () => {
@@ -70,6 +159,45 @@ describe("CommandService", () => {
 
     expect(result.text).toContain("清空队列功能已关闭");
     expect(queue.getCurrent()).toBeDefined();
+  });
+
+  it("shows every pending song in the queue response", async () => {
+    const { service } = createService();
+    await service.execute({ type: "request_song", query: "第一首 A" }, message("u1"));
+    await service.execute({ type: "request_song", query: "第二首 B" }, message("u2"));
+    await service.execute({ type: "request_song", query: "第三首 C" }, message("u3"));
+    await service.execute({ type: "request_song", query: "第四首 D" }, message("u4"));
+
+    const result = await service.execute({ type: "show_queue" }, message("u5"));
+
+    expect(result.text).toContain("待播放：3 首");
+    expect(result.text).toContain("B - 第二首");
+    expect(result.text).toContain("C - 第三首");
+    expect(result.text).toContain("D - 第四首");
+  });
+
+  it("shows recent play history", async () => {
+    const { service } = createServiceWithPlayer();
+    await service.execute({ type: "request_song", query: "第一首 A" }, message("u1"));
+    await service.execute({ type: "request_song", query: "第二首 B" }, message("u2"));
+    await service.execute({ type: "skip" }, message("u3"));
+
+    const result = await service.execute({ type: "history" }, message("u4"));
+
+    expect(result.text).toContain("最近播放历史");
+    expect(result.text).toContain("A - 第一首");
+  });
+
+  it("returns chat help with playback controls", async () => {
+    const { service } = createService();
+
+    const result = await service.execute({ type: "help" }, message("u1"));
+
+    expect(result.text).toContain("艾特机器人后直接发歌名");
+    expect(result.text).toContain("群里直接发送歌名也会自动搜索");
+    expect(result.text).toContain("切歌");
+    expect(result.text).toContain("暂停");
+    expect(result.text).toContain("历史记录");
   });
 
   it("moves and removes pending queue items", async () => {

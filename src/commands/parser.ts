@@ -2,11 +2,18 @@ import type { Command } from "../domain/types.js";
 
 const INFO_COMMAND_ALIASES = new Map<string, Command["type"]>([
   ["队列", "show_queue"],
+  ["待播放", "show_queue"],
   ["当前播放", "current"],
   ["当前", "current"],
   ["撤销我的点歌", "cancel_mine"],
   ["撤销", "cancel_mine"],
   ["取消", "cancel_mine"],
+  ["切歌", "skip"],
+  ["下一首", "skip"],
+  ["暂停", "pause"],
+  ["继续", "resume"],
+  ["历史记录", "history"],
+  ["历史", "history"],
   ["帮助", "help"],
   ["help", "help"]
 ]);
