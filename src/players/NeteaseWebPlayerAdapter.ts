@@ -50,7 +50,17 @@ const LOGIN_QR_SELECTORS = [
   ".mrc-modal-container[role='dialog'] ._2SF8rF8D img",
   ".mrc-modal-container[role='dialog'] canvas",
   ".m-layer:has-text('登录获取更懂你的好音乐') img[src^='data:image']",
+  ".m-layer:has-text('登录获取更懂你的好音乐') img",
   ".m-layer:has-text('登录获取更懂你的好音乐') canvas",
+  ".m-layer:has-text('扫码登录') img[src^='data:image']",
+  ".m-layer:has-text('扫码登录') img",
+  ".m-layer:has-text('扫码登录') canvas",
+  ".m-layer img[src^='data:image']",
+  ".m-layer img",
+  ".m-layer canvas",
+  "[role='dialog'] img[src^='data:image']",
+  "[role='dialog'] img",
+  "[role='dialog'] canvas",
   "[data-log*='mod_web_qr_code_login'] img[src^='data:image']",
   "[data-log*='mod_web_qr_code_login'] img",
   "[data-log*='mod_web_qr_code_login'] canvas"
@@ -183,6 +193,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
 
     const clicked = await this.clickSongPagePlay(page);
     if (!clicked) {
+      await this.throwIfLoginRequired(page);
       throw new Error("Could not find the NetEase song page play button.");
     }
     console.log(`[netease-web] clicked play for ${item.track.artist} - ${item.track.title}`);
@@ -309,7 +320,14 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
 
   private async assertLoggedInForPlayback(page: PageLike): Promise<void> {
     const surface = await this.readLoginSurfaceAfterSettling(page);
-    if (surface.state === "login_required") {
+    if (surface.state === "login_required" || (await this.pageShowsExplicitLoginPrompt(page))) {
+      throw new NeteaseLoginRequiredError();
+    }
+  }
+
+  private async throwIfLoginRequired(page: PageLike): Promise<void> {
+    const loginSurface = await this.readLoginSurface(page);
+    if (loginSurface.state === "login_required" || (await this.pageShowsExplicitLoginPrompt(page))) {
       throw new NeteaseLoginRequiredError();
     }
   }
@@ -702,10 +720,7 @@ export class NeteaseWebPlayerAdapter implements LoginAwarePlayerAdapter {
       await page.waitForTimeout(PLAYBACK_POLL_INTERVAL_MS);
     }
 
-    const loginSurface = await this.readLoginSurface(page);
-    if (loginSurface.state === "login_required" || (await this.pageShowsExplicitLoginPrompt(page))) {
-      throw new NeteaseLoginRequiredError();
-    }
+    await this.throwIfLoginRequired(page);
 
     throw new Error(
       "Clicked the NetEase song-page play button, but the bottom player did not switch to the target song. The track may require the desktop client, VIP rights, or another manual confirmation."

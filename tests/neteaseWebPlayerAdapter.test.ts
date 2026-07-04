@@ -215,6 +215,40 @@ describe("NeteaseWebPlayerAdapter login QR detection", () => {
     await expect((adapter as any).pageShowsExplicitLoginPrompt(page)).resolves.toBe(true);
   });
 
+  it("reports login required when the song page has no play button because a login modal is open", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      routeInPlaceSucceeds: true,
+      songInfoVisible: true,
+      missingPlayButtonRevealsLoginPrompt: true
+    });
+    const adapter = adapterWithPage(page);
+
+    await expect(adapter.play(queueItem("song-190449", "吻别", "张学友"))).rejects.toMatchObject({
+      name: "NeteaseLoginRequiredError"
+    });
+  });
+
+  it("captures the legacy NetEase layer QR image", async () => {
+    const page = new FakePage({
+      domToggleSucceeds: false,
+      qrScreenshot: Buffer.from("legacy-qr"),
+      surfaceSnapshot: {
+        profileCandidateCount: 0,
+        profileTexts: [],
+        loginModalCandidateCount: 1,
+        loginModalTexts: ["登录获取更懂你的好音乐 扫码登录"],
+        loginTexts: ["登录"]
+      }
+    });
+    const adapter = adapterWithPage(page);
+
+    const status = await adapter.getLoginStatus();
+
+    expect(status.state).toBe("login_required");
+    expect(status.qrCode?.data.toString()).toBe("legacy-qr");
+  });
+
   it("reuses the persistent NetEase login cookie after a restart", async () => {
     const page = new FakePage({
       domToggleSucceeds: false,
@@ -509,6 +543,7 @@ class FakePage {
   currentUrl = "https://music.163.com/";
   frameUrl = "https://music.163.com/";
   keyboardPresses: string[] = [];
+  explicitLoginPromptVisible?: boolean;
   closed = false;
   keyboard = {
     press: async (key: string) => {
@@ -523,6 +558,8 @@ class FakePage {
       qrScreenshot?: Buffer;
       dialogScreenshot?: Buffer;
       explicitLoginPromptVisible?: boolean;
+      songInfoVisible?: boolean;
+      missingPlayButtonRevealsLoginPrompt?: boolean;
       loginEntryClicksBeforeSuccess?: number;
       routeInPlaceSucceeds?: boolean;
       surfaceSnapshot?: {
@@ -537,6 +574,12 @@ class FakePage {
 
   frames(): FakePage[] {
     return [];
+  }
+
+  frameLocator(): { locator: (selector: string) => FakeLocator } {
+    return {
+      locator: (selector: string) => this.locator(selector)
+    };
   }
 
   locator(selector: string): FakeLocator {
@@ -555,6 +598,21 @@ class FakePage {
       return new FakeLocator(() => {
         this.domToggleAttempts += 1;
         return this.options.domToggleSucceeds;
+      });
+    }
+
+    if (selector.includes(".m-info")) {
+      if (selector.includes(".btns")) {
+        if (this.options.missingPlayButtonRevealsLoginPrompt) {
+          this.explicitLoginPromptVisible = true;
+        }
+
+        return new FakeLocator(() => "");
+      }
+
+      return new FakeLocator(() => "", {
+        visible: Boolean(this.options.songInfoVisible),
+        text: this.options.songInfoVisible ? "song info" : ""
       });
     }
 
@@ -623,7 +681,15 @@ class FakePage {
     }
 
     if (source.includes("looksLikeExplicitLoginPrompt")) {
-      return Boolean(this.options.explicitLoginPromptVisible);
+      return Boolean(this.explicitLoginPromptVisible ?? this.options.explicitLoginPromptVisible);
+    }
+
+    if (source.includes(".m-info .btns")) {
+      if (this.options.missingPlayButtonRevealsLoginPrompt) {
+        this.explicitLoginPromptVisible = true;
+      }
+
+      return false;
     }
 
     if (source.includes("#g_player")) {
@@ -678,6 +744,8 @@ class FakeLocator {
       screenshot?: Buffer;
       width?: number;
       height?: number;
+      visible?: boolean;
+      text?: string;
       evaluate?: (callback?: (...args: any[]) => unknown, ...args: any[]) => unknown;
     } = {}
   ) {}
@@ -687,7 +755,7 @@ class FakeLocator {
   }
 
   async waitFor(): Promise<void> {
-    if (!this.options.screenshot && !this.options.click) {
+    if (!this.options.screenshot && !this.options.click && !this.options.visible) {
       throw new Error("not visible");
     }
   }
@@ -713,7 +781,7 @@ class FakeLocator {
   }
 
   async textContent(): Promise<string> {
-    return "";
+    return this.options.text ?? "";
   }
 
   async boundingBox(): Promise<{ width: number; height: number } | undefined> {
